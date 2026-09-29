@@ -15,6 +15,7 @@ object Prefs {
     const val KEY_WAKE_WORD = "wake_word"
     const val KEY_LLM_MODEL = "llm_model"
     const val KEY_ENABLED = "service_enabled"
+    const val KEY_FOLLOW_UP = "follow_up_seconds"
 
     // Matches README.md ("Confira a URL do servidor e o token (já vêm
     // preenchidos)"), so a fresh install works without manual setup.
@@ -22,7 +23,24 @@ object Prefs {
     const val DEFAULT_TOKEN = "nanobot-voice"
     const val DEFAULT_VOICE = "santa"
     const val DEFAULT_WAKE_WORD = "HEY NANOBOT"
-    const val DEFAULT_LLM_MODEL = "gpt-4o-mini"
+    const val DEFAULT_LLM_MODEL = "deepseek/deepseek-v4.1-flash"
+
+    /**
+     * Seconds the assistant keeps listening for a follow-up question right
+     * after answering, so a back-and-forth conversation does not require
+     * repeating the wake word every time. 0 disables the follow-up window.
+     */
+    const val DEFAULT_FOLLOW_UP_SECONDS = 8
+
+    /** Pick-list for the "seguir ouvindo" spinner: label -> seconds. */
+    val FOLLOW_UP_LABELS = listOf(
+        "Desligado (repetir wake word)",
+        "5 segundos",
+        "8 segundos",
+        "12 segundos",
+        "20 segundos"
+    )
+    val FOLLOW_UP_VALUES = listOf(0, 5, 8, 12, 20)
 
     /** Selectable voices. The value sent to the server is the voice *key*
      *  (see VOICE_KEYS / the server's /voices endpoint); the label is what the
@@ -48,12 +66,13 @@ object Prefs {
     val VOICES = VOICE_LABELS
 
     val LLM_SUGGESTIONS = listOf(
-        "gpt-4o-mini",
-        "gpt-4o",
-        "llama3.1:8b",
-        "qwen2.5:7b",
-        "gemini-1.5-flash",
-        "claude-3-5-sonnet"
+        "deepseek/deepseek-v4.1-flash",
+        "openai/gpt-4o-mini",
+        "openai/gpt-4o",
+        "google/gemini-2.5-flash",
+        "anthropic/claude-sonnet-4",
+        "meta-llama/llama-3.1-8b-instruct",
+        "qwen/qwen-2.5-7b-instruct"
     )
 
     fun get(ctx: Context) = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -64,4 +83,9 @@ object Prefs {
     fun wakeWord(ctx: Context) = get(ctx).getString(KEY_WAKE_WORD, DEFAULT_WAKE_WORD) ?: DEFAULT_WAKE_WORD
     fun llmModel(ctx: Context) = get(ctx).getString(KEY_LLM_MODEL, DEFAULT_LLM_MODEL) ?: DEFAULT_LLM_MODEL
     fun enabled(ctx: Context) = get(ctx).getBoolean(KEY_ENABLED, false)
+
+    /** Seconds of follow-up listening after a reply (0 = off). */
+    fun followUpSeconds(ctx: Context): Int = get(ctx)
+        .getInt(KEY_FOLLOW_UP, DEFAULT_FOLLOW_UP_SECONDS)
+        .coerceAtLeast(0)
 }

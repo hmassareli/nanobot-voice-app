@@ -16,6 +16,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -41,8 +42,10 @@ class MainActivity : Activity() {
     private lateinit var serverUrl: EditText
     private lateinit var token: EditText
     private lateinit var voiceSpinner: Spinner
+    private lateinit var followUpSpinner: Spinner
     private lateinit var wakeWord: EditText
     private lateinit var llmModel: EditText
+    private lateinit var modelSpinner: Spinner
     private lateinit var status: TextView
     private lateinit var toggleButton: Button
 
@@ -95,9 +98,34 @@ class MainActivity : Activity() {
         root.addView(label("Frase da wake word"))
         root.addView(wakeWord)
 
+        root.addView(label("Continuar ouvindo após a resposta"))
+        followUpSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                Prefs.FOLLOW_UP_LABELS
+            )
+        }
+        root.addView(followUpSpinner)
+
+        modelSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                Prefs.LLM_SUGGESTIONS
+            )
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                    llmModel.setText(Prefs.LLM_SUGGESTIONS[pos])
+                }
+                override fun onNothingSelected(p: AdapterView<*>?) {}
+            }
+        }
+
         llmModel = field("Modelo LLM", Prefs.DEFAULT_LLM_MODEL, InputType.TYPE_CLASS_TEXT)
-        root.addView(label("Modelo LLM"))
+        root.addView(label("Modelo LLM (sugestões abaixo; pode digitar outro)"))
         root.addView(llmModel)
+        root.addView(modelSpinner)
 
         root.addView(space(8))
 
@@ -180,16 +208,22 @@ class MainActivity : Activity() {
         llmModel.setText(Prefs.llmModel(this))
         val idx = Prefs.VOICE_KEYS.indexOf(Prefs.voice(this))
         if (idx >= 0) voiceSpinner.setSelection(idx)
+        val fIdx = Prefs.FOLLOW_UP_VALUES.indexOf(Prefs.followUpSeconds(this))
+        if (fIdx >= 0) followUpSpinner.setSelection(fIdx)
     }
 
     private fun savePrefs() {
         val voiceKey = Prefs.VOICE_KEYS.getOrElse(voiceSpinner.selectedItemPosition) { Prefs.DEFAULT_VOICE }
+        val followUp = Prefs.FOLLOW_UP_VALUES.getOrElse(followUpSpinner.selectedItemPosition) {
+            Prefs.DEFAULT_FOLLOW_UP_SECONDS
+        }
         Prefs.get(this).edit()
             .putString(Prefs.KEY_SERVER_URL, serverUrl.text.toString().trim())
             .putString(Prefs.KEY_TOKEN, token.text.toString().trim())
             .putString(Prefs.KEY_VOICE, voiceKey)
             .putString(Prefs.KEY_WAKE_WORD, wakeWord.text.toString().trim())
             .putString(Prefs.KEY_LLM_MODEL, llmModel.text.toString().trim())
+            .putInt(Prefs.KEY_FOLLOW_UP, followUp)
             .apply()
         toast("Configurações salvas")
         setStatus("Configurações salvas.")

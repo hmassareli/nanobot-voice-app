@@ -215,7 +215,7 @@ def _remember(user_text: str, answer: str) -> None:
     del HISTORY[:-MAX_HISTORY]
 
 
-async def run_agent(user_text: str) -> str:
+async def run_agent(user_text: str, model: str | None = None) -> str:
     """Non-streaming agent (kept for /ask and as a fallback)."""
     if not OPENROUTER_API_KEY:
         return "Serviço sem chave de LLM configurada."
@@ -226,7 +226,7 @@ async def run_agent(user_text: str) -> str:
     async with httpx.AsyncClient(timeout=120) as client:
         for _ in range(MAX_TOOL_ROUNDS):
             payload = {
-                "model": MODEL,
+                "model": model or MODEL,
                 "messages": messages,
                 "tools": TOOLS,
                 "provider": _provider_route(),
@@ -255,7 +255,7 @@ async def run_agent(user_text: str) -> str:
         return "Desculpe, não consegui concluir a solicitação."
 
 
-async def stream_agent(user_text: str):
+async def stream_agent(user_text: str, model: str | None = None):
     """Streaming agent: yields content deltas as they arrive from OpenRouter.
 
     Tool-calling is supported across rounds: if the model emits tool_calls in a
@@ -273,7 +273,7 @@ async def stream_agent(user_text: str):
     async with httpx.AsyncClient(timeout=120) as client:
         for _ in range(MAX_TOOL_ROUNDS):
             payload = {
-                "model": MODEL,
+                "model": model or MODEL,
                 "messages": messages,
                 "tools": TOOLS,
                 "provider": _provider_route(),
@@ -616,13 +616,14 @@ def _authed(request: Request) -> bool:
     return auth == f"Bearer {VOICE_TOKEN}"
 
 
-async def _parse_input(request: Request) -> tuple[str, float, str | None]:
+async def _parse_input(request: Request) -> tuple[str, float, str | None, str | None]:
     """Extract the user text from either JSON {"text": ...} or multipart audio.
-    Returns (text, stt_ms, voice)."""
+    Returns (text, stt_ms, voice, llm)."""
     ctype = request.headers.get("content-type", "")
     text = ""
     stt_ms = 0.0
     voice: str | None = None
+    llm: str | None = None
     if ctype.startswith("application/json"):
         try:
             body = await request.json()
@@ -630,9 +631,11 @@ async def _parse_input(request: Request) -> tuple[str, float, str | None]:
             body = {}
         text = (body.get("text") or "").strip()
         voice = (body.get("voice") or "").strip() or None
+        llm = (body.get("llm") or body.get("model") or "").strip() or None
     else:
         form = await request.form()
         voice = (form.get("voice") or "").strip() or None
+        llm = (form.get("llm") or form.get("model") or "").strip() or None
         up = form.get("audio")
         if up is not None:
             suffix = Path(getattr(up, "filename", "") or "a.wav").suffix or ".wav"
@@ -648,7 +651,7 @@ async def _parse_input(request: Request) -> tuple[str, float, str | None]:
                     os.remove(tmp)
                 except OSError:
                     pass
-    return text, stt_ms, voice
+    return text, stt_ms, voice, llm
 
 
 @app.post("/ask")
@@ -657,14 +660,14 @@ async def ask(request: Request):
     if not _authed(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    text, stt_ms, voice = await _parse_input(request)
+    text, stt_ms, voice, llm = await _parse_input(request)
     if not text:
         text = "(não entendi o áudio)"
 
-    log.info("ask text=%r voice=%r", text[:200], voice)
+    log.info("ask text=%r voice=%r llm=%r", text[:200], voice, llm)
 
     t_llm = time.perf_counter()
-    answer = await run_agent(text)
+    answer = await run_agent(text, llm)
     llm_ms = (time.perf_counter() - t_llm) * 1000
 
     t_tts = time.perf_counter()
@@ -708,10 +711,10 @@ async def ask_stream(request: Request):
     async def gen():
         t_start = time.perf_counter()
         try:
-            text, stt_ms, voice = await _parse_input(request)
+            text, stt_ms, voice, llm = await _parse_input(request)
             if not text:
                 text = "(não entendi o áudio)"
-            log.info("ask_stream text=%r voice=%r", text[:200], voice)
+            log.info("ask_stream text=%r voice=%r llm=%r", text[:200], voice, llm)
 
             t_llm = time.perf_counter()
             first_token_ms = None
@@ -727,7 +730,7 @@ async def ask_stream(request: Request):
                 nonlocal first_token_ms
                 buf = SentenceBuffer()
                 try:
-                    async for piece in stream_agent(text):
+                    async for piece in stream_agent(text, llm):
                         if first_token_ms is None:
                             first_token_ms = (time.perf_counter() - t_llm) * 1000
                         full_answer.append(piece)

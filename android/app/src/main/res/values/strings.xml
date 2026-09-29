@@ -5,4 +5,6 @@
     <string name="notif_channel_desc">Mantém o assistente de voz ativo em segundo plano</string>
     <string name="notif_title">Assistente ativo — ouvindo</string>
     <string name="notif_text">Diga a wake word para falar</string>
+    <!-- %1$d = seconds left in the follow-up window -->
+    <string name="notif_follow_up">Ouvindo… pode continuar falando (%1$d s)</string>
 </resources>

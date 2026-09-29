@@ -129,6 +129,14 @@ class VoiceService : Service() {
 
     private suspend fun runLoop() {
         val ctx = applicationContext
+
+        // Drop any stale trigger left over from an earlier cycle (e.g. the user
+        // tapped "Testar" twice) so we never start recording without a fresh
+        // request.
+        while (requests.tryReceive().isSuccess) {
+            // drain
+        }
+
         // (Re)create the engine each cycle so a changed wake word / config applies.
         while (active) {
             val wakeWord = Prefs.wakeWord(ctx)
@@ -142,77 +150,125 @@ class VoiceService : Service() {
                 updateNotification("Modo push-to-talk (KWS indisponível). Use \"Testar\".")
             }
 
-            // Wait for a wake word or a manual trigger.
+            // Wait for a wake word or a manual trigger. Drop anything stale first
+            // so a queued trigger cannot immediately re-trigger recording.
+            while (requests.tryReceive().isSuccess) {
+                // drain
+            }
             requests.receive()
 
             engine.stop()
             if (!active) break
 
-            updateNotification("Ouvindo você…")
-            beep()
-            val wav = try {
-                recordUtterance()
-            } catch (t: Throwable) {
-                Log.e(TAG, "Falha na gravação", t)
-                null
-            }
-            if (wav == null || wav.size < 3200) {
+            handleRequest(ctx)
+        }
+    }
+
+    /**
+     * Records one utterance, sends it to the backend, plays the answer and then
+     * optionally keeps the conversation going: while the follow-up window is
+     * enabled the assistant keeps listening after its reply, so the user does
+     * not have to repeat the wake word every single time.
+     */
+    private suspend fun handleRequest(ctx: Context) {
+        var wav: ByteArray = recordForRequest(waitMillis = 4000, countdown = false)
+            ?: run {
                 updateNotification("Não ouvi nada. Tente novamente.")
-                continue
+                return
             }
 
-            updateNotification("Pensando…")
+        while (active) {
+            askAndPlay(ctx, wav)
+            if (!active) return
 
-            // --- streaming playback -------------------------------------------
-            // The stream reader (IO) pushes each audio chunk into this channel and
-            // never waits for playback. A dedicated worker consumes the channel and
-            // plays the chunks *sequentially* (one MediaPlayer per chunk), starting
-            // with the very first one as soon as it arrives.
-            val audioChunks = Channel<ByteArray>(Channel.UNLIMITED)
-            var startedPlaying = false
+            val followUpSeconds = Prefs.followUpSeconds(ctx)
+            if (followUpSeconds <= 0) return
 
-            val playerJob = scope.launch {
-                for (chunk in audioChunks) {
-                    try {
-                        playAudio(chunk)
-                    } catch (t: Throwable) {
-                        Log.e(TAG, "Erro ao tocar áudio", t)
-                    }
+            // Nothing said in the follow-up window -> the conversation is over,
+            // go back to listening for the wake word.
+            wav = recordForRequest(waitMillis = followUpSeconds * 1000, countdown = true)
+                ?: return
+        }
+    }
+
+    /** Records an utterance; returns null when nothing (loud enough) was said. */
+    private fun recordForRequest(waitMillis: Int, countdown: Boolean): ByteArray? {
+        updateNotification(if (countdown) "Ouvindo… pode continuar falando" else "Ouvindo você…")
+        if (!countdown) beep()
+        val wav = try {
+            recordUtterance(waitMillis, if (countdown) { s ->
+                updateNotification(getString(R.string.notif_follow_up, s))
+            } else null)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Falha na gravação", t)
+            null
+        }
+        return wav?.takeIf { it.size >= 3200 }
+    }
+
+    /** Sends [wav] to the backend and streams the spoken answer. */
+    private suspend fun askAndPlay(ctx: Context, wav: ByteArray) {
+        updateNotification("Pensando…")
+
+        // --- streaming playback -------------------------------------------
+        // The stream reader (IO) pushes each audio chunk into this channel and
+        // never waits for playback. A dedicated worker consumes the channel and
+        // plays the chunks *sequentially* (one MediaPlayer per chunk), starting
+        // with the very first one as soon as it arrives.
+        val audioChunks = Channel<ByteArray>(Channel.UNLIMITED)
+        var startedPlaying = false
+
+        val playerJob = scope.launch {
+            for (chunk in audioChunks) {
+                try {
+                    playAudio(chunk)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Erro ao tocar áudio", t)
                 }
             }
+        }
 
-            try {
-                NanobotClient(Prefs.serverUrl(ctx), Prefs.token(ctx)).askStream(
-                    wav, Prefs.voice(ctx), Prefs.llmModel(ctx),
-                    onText = { text ->
-                        Log.i(TAG, "Resposta: $text")
-                        updateNotification(text.take(80))
-                    },
-                    onAudioChunk = { bytes ->
-                        if (!startedPlaying) {
-                            startedPlaying = true
-                            updateNotification("Respondendo…")
-                        }
-                        // trySend on an UNLIMITED channel never blocks the reader.
-                        audioChunks.trySend(bytes)
+        try {
+            NanobotClient(Prefs.serverUrl(ctx), Prefs.token(ctx)).askStream(
+                wav, Prefs.voice(ctx), Prefs.llmModel(ctx),
+                onText = { text ->
+                    Log.i(TAG, "Resposta: $text")
+                    updateNotification(text.take(80))
+                },
+                onAudioChunk = { bytes ->
+                    if (!startedPlaying) {
+                        startedPlaying = true
+                        updateNotification("Respondendo…")
                     }
-                )
-            } catch (t: Throwable) {
-                Log.e(TAG, "Erro no backend", t)
-                updateNotification("Erro ao falar com o servidor: ${t.message}")
-            } finally {
-                // Signal end-of-stream so the player worker drains and exits.
-                audioChunks.close()
-                playerJob.join()
-            }
+                    // trySend on an UNLIMITED channel never blocks the reader.
+                    audioChunks.trySend(bytes)
+                }
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "Erro no backend", t)
+            updateNotification("Erro ao falar com o servidor: ${t.message}")
+        } finally {
+            // Signal end-of-stream so the player worker drains and exits.
+            audioChunks.close()
+            playerJob.join()
         }
     }
 
     /**
      * Records the user's utterance (16 kHz mono PCM) until ~1.1s of trailing
-     * silence is detected, with hard caps for the pre-speech and total time.
+     * silence is detected.
+     *
+     * @param waitMillis how long to wait for speech to start. After a reply the
+     *   caller passes the follow-up window so the conversation can continue
+     *   without repeating the wake word; a short window keeps a stray noise from
+     *   being captured.
+     * @param onCountdown optional callback invoked once per second with the
+     *   remaining seconds, used to update the notification while we wait.
      */
-    private fun recordUtterance(): ByteArray {
+    private fun recordUtterance(
+        waitMillis: Int = 4000,
+        onCountdown: ((Int) -> Unit)? = null
+    ): ByteArray {
         val sampleRate = SAMPLE_RATE
         val minBuf = AudioRecord.getMinBufferSize(
             sampleRate,
@@ -233,7 +289,7 @@ class VoiceService : Service() {
         val collected = ArrayList<Short>(sampleRate * 8)
         val maxTotalFrames = 500          // 10 s total
         val maxSilentFramesAfterSpeech = 1100 / 20 // ~1.1 s
-        val maxWaitFrames = 200           // ~4 s waiting for speech
+        val maxWaitFrames = (waitMillis / 20).coerceAtLeast(20) // waiting for speech
         val speechRmsThreshold = 1400.0
 
         var speechStarted = false
@@ -257,6 +313,10 @@ class VoiceService : Service() {
 
                 if (!speechStarted) {
                     waitedFrames++
+                    if (waitedFrames % 50 == 0) {
+                        val remaining = ((maxWaitFrames - waitedFrames) / 50).coerceAtLeast(0)
+                        onCountdown?.invoke(remaining)
+                    }
                     if (rms > speechRmsThreshold) {
                         speechStarted = true
                     } else if (waitedFrames > maxWaitFrames) {

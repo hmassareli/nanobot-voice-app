@@ -104,8 +104,23 @@ class SherpaWakeWordEngine(
         )
         val kws = KeywordSpotter(assetManager = assets, config = config)
         spotter = kws
-        // A per-session stream; an empty string makes sherpa use keywordsFile.
-        stream = kws.createStream()
+
+        // The keyword the user typed must actually drive detection. sherpa needs
+        // it tokenised with the model's BPE vocabulary (a raw word fails with
+        // "Cannot find ID for token ..."), so tokenise on-device and pass the
+        // line to createStream(). If that fails, fall back to the bundled
+        // keywords.txt via an empty stream.
+        val tokenised = BpeTokenizer.keywordLine(wakeWord)
+        var st: OnlineStream? = null
+        if (tokenised != null) {
+            Log.i(TAG, "Wake word '$wakeWord' -> '$tokenised'")
+            st = kws.createStream(tokenised)
+        }
+        if (st == null) {
+            Log.w(TAG, "Tokenização falhou para '$wakeWord'; usando keywords.txt")
+            st = kws.createStream()
+        }
+        stream = st
     }
 
     private fun initRecorder() {
