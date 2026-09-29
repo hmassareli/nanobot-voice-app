@@ -16,7 +16,10 @@ object Prefs {
     const val KEY_LLM_MODEL = "llm_model"
     const val KEY_ENABLED = "service_enabled"
 
-    const val DEFAULT_SERVER_URL = "https://nanobot.example.com"
+    // Matches README.md ("Confira a URL do servidor e o token (já vêm
+    // preenchidos)"), so a fresh install works without manual setup.
+    const val DEFAULT_SERVER_URL = "https://nanobot-voice-api.lnyx9r.easypanel.host"
+    const val DEFAULT_TOKEN = "nanobot-voice"
     const val DEFAULT_VOICE = "santa"
     const val DEFAULT_WAKE_WORD = "HEY NANOBOT"
     const val DEFAULT_LLM_MODEL = "gpt-4o-mini"
@@ -56,7 +59,7 @@ object Prefs {
     fun get(ctx: Context) = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
     fun serverUrl(ctx: Context) = get(ctx).getString(KEY_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL
-    fun token(ctx: Context) = get(ctx).getString(KEY_TOKEN, "") ?: ""
+    fun token(ctx: Context) = get(ctx).getString(KEY_TOKEN, DEFAULT_TOKEN) ?: DEFAULT_TOKEN
     fun voice(ctx: Context) = get(ctx).getString(KEY_VOICE, DEFAULT_VOICE) ?: DEFAULT_VOICE
     fun wakeWord(ctx: Context) = get(ctx).getString(KEY_WAKE_WORD, DEFAULT_WAKE_WORD) ?: DEFAULT_WAKE_WORD
     fun llmModel(ctx: Context) = get(ctx).getString(KEY_LLM_MODEL, DEFAULT_LLM_MODEL) ?: DEFAULT_LLM_MODEL

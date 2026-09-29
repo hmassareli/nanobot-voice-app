@@ -77,7 +77,7 @@ class MainActivity : Activity() {
         root.addView(label("URL do servidor"))
         root.addView(serverUrl)
 
-        token = field("Token", "nanobot-voice", InputType.TYPE_CLASS_TEXT)
+        token = field("Token", Prefs.DEFAULT_TOKEN, InputType.TYPE_CLASS_TEXT)
         root.addView(label("Token"))
         root.addView(token)
 
