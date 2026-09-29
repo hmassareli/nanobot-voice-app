@@ -1,6 +1,7 @@
 package com.nanobot.voice
 
 import android.util.Log
+import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -64,17 +65,46 @@ class NanobotClient(
 ) {
     private val baseUrl: String = serverUrl.trimEnd('/')
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(timeoutSeconds, TimeUnit.SECONDS)
-        .readTimeout(timeoutSeconds, TimeUnit.SECONDS)
-        .build()
+    // Shared across every NanobotClient instance so the TCP+TLS handshake and
+    // the connection pool are reused between turns. Creating a fresh client per
+    // turn (as we used to) paid a full handshake on every single request, which
+    // showed up as ~0.5-1s of extra latency before the first audio.
+    private val http: OkHttpClient
+        get() = sharedHttp(timeoutSeconds)
+
+    companion object {
+        @Volatile
+        private var cached: OkHttpClient? = null
+        @Volatile
+        private var cachedTimeout: Long = -1
+
+        /** One process-wide client with a persistent connection pool. */
+        private fun sharedHttp(timeoutSeconds: Long): OkHttpClient {
+            val existing = cached
+            if (existing != null && cachedTimeout == timeoutSeconds) return existing
+            synchronized(this) {
+                val again = cached
+                if (again != null && cachedTimeout == timeoutSeconds) return again
+                val built = OkHttpClient.Builder()
+                    .connectTimeout(15, TimeUnit.SECONDS)
+                    .writeTimeout(timeoutSeconds, TimeUnit.SECONDS)
+                    .readTimeout(timeoutSeconds, TimeUnit.SECONDS)
+                    // Keep idle sockets alive so the next turn skips the handshake.
+                    .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
+                    .retryOnConnectionFailure(true)
+                    .build()
+                cached = built
+                cachedTimeout = timeoutSeconds
+                return built
+            }
+        }
+    }
 
     @Throws(IOException::class)
-    fun ask(wavBytes: ByteArray, voice: String, llmModel: String?): AskResult {
+    fun ask(audioBytes: ByteArray, voice: String, llmModel: String?, audioFormat: String = "wav"): AskResult {
         val reqBuilder = Request.Builder()
             .url("$baseUrl/ask")
-            .post(buildMultipart(wavBytes, voice, llmModel))
+            .post(buildMultipart(audioBytes, voice, llmModel, audioFormat))
         if (token.isNotBlank()) {
             reqBuilder.header("Authorization", "Bearer $token")
         }
@@ -125,29 +155,30 @@ class NanobotClient(
      */
     @Throws(IOException::class)
     fun askStream(
-        wavBytes: ByteArray,
+        audioBytes: ByteArray,
         voice: String,
         llmModel: String?,
         onText: (String) -> Unit,
         onAudioChunk: (ByteArray) -> Unit,
-        onTurnId: ((String) -> Unit)? = null
+        onTurnId: ((String) -> Unit)? = null,
+        audioFormat: String = "wav"
     ): StreamMetrics {
         val t0 = System.currentTimeMillis()
         var firstAudioMs: Long? = null
         var chunks = 0
-        var audioBytes = 0L
+        var receivedBytes = 0L
         var turnId: String? = null
 
         fun noteChunk(bytes: ByteArray) {
             if (firstAudioMs == null) firstAudioMs = System.currentTimeMillis() - t0
             chunks++
-            audioBytes += bytes.size.toLong()
+            receivedBytes += bytes.size.toLong()
             onAudioChunk(bytes)
         }
 
         val reqBuilder = Request.Builder()
             .url("$baseUrl/ask_stream")
-            .post(buildMultipart(wavBytes, voice, llmModel))
+            .post(buildMultipart(audioBytes, voice, llmModel, audioFormat))
         if (token.isNotBlank()) {
             reqBuilder.header("Authorization", "Bearer $token")
         }
@@ -159,11 +190,11 @@ class NanobotClient(
             if (resp.code == 404) {
                 // Old server without /ask_stream — fall back to the plain endpoint.
                 Log.w("NanobotClient", "/ask_stream ausente (404) — usando /ask")
-                val result = ask(wavBytes, voice, llmModel)
+                val result = ask(audioBytes, voice, llmModel, audioFormat)
                 if (result.text.isNotBlank()) onText(result.text)
                 if (result.audio.isNotEmpty()) noteChunk(result.audio)
                 result.turnId?.let { onTurnId?.invoke(it) }
-                return StreamMetrics(result.turnId, firstAudioMs, chunks, audioBytes, t0)
+                return StreamMetrics(result.turnId, firstAudioMs, chunks, receivedBytes, t0)
             }
             if (!resp.isSuccessful) {
                 val bodyStr = resp.body?.string().orEmpty()
@@ -203,7 +234,7 @@ class NanobotClient(
                             turnId = id
                             onTurnId?.invoke(id)
                         }
-                        return StreamMetrics(turnId, firstAudioMs, chunks, audioBytes, t0)
+                        return StreamMetrics(turnId, firstAudioMs, chunks, receivedBytes, t0)
                     }
                     "error" -> throw IOException(
                         evt.optString("message", "erro desconhecido do servidor")
@@ -212,7 +243,7 @@ class NanobotClient(
                 }
             }
         }
-        return StreamMetrics(turnId, firstAudioMs, chunks, audioBytes, t0)
+        return StreamMetrics(turnId, firstAudioMs, chunks, receivedBytes, t0)
     }
 
     /**
@@ -242,12 +273,27 @@ class NanobotClient(
         }.apply { isDaemon = true }.start()
     }
 
-    private fun buildMultipart(wavBytes: ByteArray, voice: String, llmModel: String?): MultipartBody {
-        val audioPart = wavBytes.toRequestBody("audio/wav".toMediaType())
+    private fun buildMultipart(
+        audioBytes: ByteArray,
+        voice: String,
+        llmModel: String?,
+        audioFormat: String = "wav"
+    ): MultipartBody {
+        // The phone encodes the utterance while recording (Opus, or AAC as a
+        // fallback), so we ship ~8-17 KB instead of ~125 KB of raw WAV. The
+        // server sniffs the container anyway, but we send the right type/filename
+        // so it can skip the guess.
+        val (mime, filename) = when (audioFormat.lowercase()) {
+            "opus", "ogg" -> "audio/ogg" to "speech.ogg"
+            "aac", "m4a", "mp4" -> "audio/mp4" to "speech.m4a"
+            else -> "audio/wav" to "speech.wav"
+        }
+        val audioPart = audioBytes.toRequestBody(mime.toMediaType())
         val builder = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart("audio", "speech.wav", audioPart)
+            .addFormDataPart("audio", filename, audioPart)
             .addFormDataPart("voice", voice)
+            .addFormDataPart("audio_format", audioFormat.lowercase())
         if (!llmModel.isNullOrBlank()) {
             builder.addFormDataPart("llm", llmModel)
         }

@@ -41,6 +41,10 @@ import kotlinx.coroutines.launch
  */
 class VoiceService : Service() {
 
+    /** One recorded utterance: the bytes to upload plus their container format
+     *  ("opus", "aac" or "wav"). */
+    private data class RecordedAudio(val bytes: ByteArray, val format: String)
+
     companion object {
         const val TAG = "VoiceService"
         const val CHANNEL_ID = "nanobot_voice_channel"
@@ -173,7 +177,7 @@ class VoiceService : Service() {
      */
     private suspend fun handleRequest(ctx: Context) {
         val rec0 = System.currentTimeMillis()
-        var wav: ByteArray = recordForRequest(waitMillis = 4000, countdown = false)
+        var rec: RecordedAudio = recordForRequest(waitMillis = 4000, countdown = false)
             ?: run {
                 updateNotification("Não ouvi nada. Tente novamente.")
                 return
@@ -181,7 +185,7 @@ class VoiceService : Service() {
         var recordMs = System.currentTimeMillis() - rec0
 
         while (active) {
-            askAndPlay(ctx, wav, recordMs)
+            askAndPlay(ctx, rec, recordMs)
             if (!active) return
 
             val followUpSeconds = Prefs.followUpSeconds(ctx)
@@ -190,17 +194,17 @@ class VoiceService : Service() {
             // Nothing said in the follow-up window -> the conversation is over,
             // go back to listening for the wake word.
             val rec1 = System.currentTimeMillis()
-            wav = recordForRequest(waitMillis = followUpSeconds * 1000, countdown = true)
+            rec = recordForRequest(waitMillis = followUpSeconds * 1000, countdown = true)
                 ?: return
             recordMs = System.currentTimeMillis() - rec1
         }
     }
 
     /** Records an utterance; returns null when nothing (loud enough) was said. */
-    private fun recordForRequest(waitMillis: Int, countdown: Boolean): ByteArray? {
+    private fun recordForRequest(waitMillis: Int, countdown: Boolean): RecordedAudio? {
         updateNotification(if (countdown) "Ouvindo… pode continuar falando" else "Ouvindo você…")
         if (!countdown) beep()
-        val wav = try {
+        val rec = try {
             recordUtterance(
                 waitMillis,
                 if (countdown) { s ->
@@ -221,11 +225,12 @@ class VoiceService : Service() {
             Log.e(TAG, "Falha na gravação", t)
             null
         }
-        return wav?.takeIf { it.size >= 3200 }
+        return rec?.takeIf { it.bytes.size >= 3200 }
     }
 
-    /** Sends [wav] to the backend and streams the spoken answer. */
-    private suspend fun askAndPlay(ctx: Context, wav: ByteArray, recordMs: Long) {
+    /** Sends [rec] to the backend and streams the spoken answer. */
+    private suspend fun askAndPlay(ctx: Context, rec: RecordedAudio, recordMs: Long) {
+        val wav = rec.bytes
         updateNotification("Pensando…")
 
         // --- streaming playback -------------------------------------------
@@ -278,7 +283,8 @@ class VoiceService : Service() {
                     // trySend on an UNLIMITED channel never blocks the reader.
                     audioChunks.trySend(bytes)
                 },
-                onTurnId = { id -> turnId = id }
+                onTurnId = { id -> turnId = id },
+                audioFormat = rec.format
             )
         } catch (t: Throwable) {
             Log.e(TAG, "Erro no backend", t)
@@ -292,15 +298,20 @@ class VoiceService : Service() {
         // --- client-side telemetry (best-effort, never blocks the voice) ---
         try {
             val m = metrics
-            val audioDurationMs = wav.size.let { bytes ->
+            val audioDurationMs = if (rec.format == "wav") {
                 // WAV header is 44 bytes; 16 kHz mono 16-bit => 32 bytes/ms.
-                val pcm = (bytes - 44).coerceAtLeast(0)
+                val pcm = (wav.size - 44).coerceAtLeast(0)
                 if (pcm > 0) pcm / 32.0 else null
+            } else {
+                // Compressed: estimate from the codec bitrate (Opus 24k / AAC 24k).
+                if (wav.isNotEmpty()) wav.size * 8.0 / 24.0 else null
             }
             val payload = JSONObject().apply {
                 turnId?.let { put("turn_id", it) }
                     ?: m?.turnId?.let { put("turn_id", it) }
                 put("record_ms", recordMs)
+                put("audio_format", rec.format)
+                put("audio_bytes", wav.size)
                 put("audio_duration_ms", audioDurationMs)
                 put("request_to_first_audio_ms", m?.firstAudioMs ?: JSONObject.NULL)
                 put("first_chunk_play_ms", firstChunkPlayMs ?: JSONObject.NULL)
@@ -359,7 +370,7 @@ class VoiceService : Service() {
         speechThreshold: Double = 350.0,
         minSpeechFrames: Int = 3,
         flushMillis: Int = 0
-    ): ByteArray {
+    ): RecordedAudio {
         val sampleRate = SAMPLE_RATE
         val minBuf = AudioRecord.getMinBufferSize(
             sampleRate,
@@ -398,6 +409,10 @@ class VoiceService : Service() {
         var frames = 0
 
         rec.startRecording()
+        // Encode in parallel with recording so the compressed audio is ready the
+        // moment the VAD ends the turn (no post-recording encode on the critical
+        // path). Falls back to raw PCM when no encoder is available.
+        val encoder = LiveAudioEncoder(cacheDir, sampleRate).also { it.start() }
         try {
             // Drain whatever the mic buffered while we were not reading (i.e.
             // during the post-answer settle), so the speaker tail never lands at
@@ -447,6 +462,8 @@ class VoiceService : Service() {
 
                 // once speech started, collect everything
                 for (i in 0 until n) collected.add(frame[i])
+                // Feed the live encoder in lock-step with the recording loop.
+                if (encoder.isActive) encoder.feed(frame, n)
 
                 if (speechStarted) {
                     if (rms > speechRmsThreshold) {
@@ -466,12 +483,18 @@ class VoiceService : Service() {
         }
 
         if (!speechStarted || collected.isEmpty()) {
-            return ByteArray(0)
+            encoder.finish() // release codec/muxer even on an empty turn
+            return RecordedAudio(ByteArray(0), "wav")
         }
 
         val samples = ShortArray(collected.size) { collected[it] }
+        // Prefer the audio encoded live during recording; fall back to raw WAV.
+        val encoded = encoder.finish()
+        if (encoded.bytes.isNotEmpty() && encoded.format != "wav") {
+            return RecordedAudio(encoded.bytes, encoded.format)
+        }
         // trim a little leading/trailing silence
-        return WavUtil.encode(samples, sampleRate)
+        return RecordedAudio(WavUtil.encode(samples, sampleRate), "wav")
     }
 
     private fun playAudio(bytes: ByteArray) {
