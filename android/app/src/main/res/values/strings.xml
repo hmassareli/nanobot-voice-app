@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Nanobot Voice</string>
+    <string name="notif_channel_name">Assistente de voz</string>
+    <string name="notif_channel_desc">Mantém o assistente de voz ativo em segundo plano</string>
+    <string name="notif_title">Assistente ativo — ouvindo</string>
+    <string name="notif_text">Diga a wake word para falar</string>
+</resources>
