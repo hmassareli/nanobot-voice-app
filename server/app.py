@@ -116,10 +116,15 @@ def build_system_prompt() -> str:
         "O usuário fala por voz. NUNCA peça para ele 'escrever' ou 'mandar por "
         "texto'. Se algo não ficou claro, peça para repetir em voz alta.",
         "Você tem acesso ao workspace do assistente com ferramentas: read_file, "
-        "list_dir e exec (shell). Use-as quando precisar consultar arquivos ou o "
-        "ambiente. Caminhos são relativos ao workspace.",
+        "list_dir, exec (shell) e curl (requisições HTTP). Use-as quando precisar "
+        "consultar arquivos, o ambiente ou a internet. Caminhos são relativos ao "
+        "workspace (/workspace).",
     ]
-    for fn in ("SOUL.md", "AGENTS.md", "USER.md", "TOOLS.md"):
+    # SOUL.md gives the same personality as the main nanobot; USER.md carries the
+    # user's profile/preferences. AGENTS.md is deliberately skipped: it documents
+    # the nanobot chat plumbing (spawn/message/cron) that this voice endpoint
+    # does not expose, and would only confuse the model.
+    for fn in ("SOUL.md", "USER.md", "TOOLS.md"):
         p = WORKSPACE / fn
         if p.exists():
             try:
@@ -167,6 +172,37 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "curl",
+            "description": (
+                "Faz uma requisição HTTP (GET por padrão) e devolve o corpo da "
+                "resposta. Use para consultar APIs públicas, checar status de "
+                "serviços/sites, buscar informações na web, etc. Ex.: "
+                "curl(url='https://api.exemplo.com/dados')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL completa (https://...)"},
+                    "method": {
+                        "type": "string",
+                        "description": "Método HTTP (GET, POST, HEAD...). Padrão GET.",
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Cabeçalhos HTTP opcionais (chave: valor).",
+                    },
+                    "data": {
+                        "type": "string",
+                        "description": "Corpo da requisição (para POST/PUT).",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 
@@ -192,6 +228,23 @@ async def dispatch_tool(name: str, args: dict) -> str:
                 capture_output=True, text=True, timeout=30,
             )
             return (r.stdout + r.stderr)[:8000] or "(sem saída)"
+        if name == "curl":
+            url = (args.get("url") or "").strip()
+            if not url:
+                return "erro: url vazia"
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            method = (args.get("method") or "GET").upper()
+            headers = args.get("headers") or {}
+            data = args.get("data")
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                r = await client.request(
+                    method, url,
+                    headers={str(k): str(v) for k, v in headers.items()} if headers else None,
+                    content=data.encode() if isinstance(data, str) else data,
+                )
+            body = r.text[:8000]
+            return f"HTTP {r.status_code}\n{body}" or f"HTTP {r.status_code} (corpo vazio)"
     except Exception as e:  # noqa: BLE001
         return f"erro: {e}"
     return "ferramenta desconhecida"
@@ -306,6 +359,10 @@ async def stream_agent(user_text: str, model: str | None = None):
                     if piece:
                         content_parts.append(piece)
                         yield piece
+                    elif delta.get("reasoning"):
+                        # Reasoning models stream their chain-of-thought too.
+                        # Drop it: it would be spoken aloud (and is slow).
+                        pass
                     for tc in delta.get("tool_calls") or []:
                         idx = tc.get("index", 0)
                         slot = tool_calls.setdefault(

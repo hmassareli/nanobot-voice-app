@@ -22,7 +22,6 @@ PROJECT = "mapa-de-membros"
 SERVICE = "nanobot-voice-api"
 HOST = "nanobot-voice-api.lnyx9r.easypanel.host"
 PORT = 8000
-WORKSPACE = "/root/.nanobot/workspace"
 
 
 def load_secrets() -> dict:
@@ -84,10 +83,9 @@ def build_dockerfile() -> str:
         "RUN mkdir -p /workspace",
         embed("/app/app.py", app),
     ]
-    for fn in ("SOUL.md", "AGENTS.md", "USER.md", "TOOLS.md"):
-        p = os.path.join(WORKSPACE, fn)
-        if os.path.exists(p):
-            parts.append(embed(f"/workspace/{fn}", open(p, "rb").read()))
+    # NOTE: SOUL.md / USER.md / TOOLS.md are NOT baked in anymore — the real
+    # nanobot workspace is bind-mounted at /workspace (EasyPanel mount), so the
+    # voice assistant sees the same files (and edits) as the main assistant.
     parts += [
         f"ENV VOICE_TOKEN={VOICE_TOKEN}",
         f"ENV OPENROUTER_API_KEY={OPENROUTER_KEY}",

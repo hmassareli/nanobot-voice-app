@@ -196,9 +196,22 @@ class VoiceService : Service() {
         updateNotification(if (countdown) "Ouvindo… pode continuar falando" else "Ouvindo você…")
         if (!countdown) beep()
         val wav = try {
-            recordUtterance(waitMillis, if (countdown) { s ->
-                updateNotification(getString(R.string.notif_follow_up, s))
-            } else null)
+            recordUtterance(
+                waitMillis,
+                if (countdown) { s ->
+                    updateNotification(getString(R.string.notif_follow_up, s))
+                } else null,
+                // Only the follow-up (post-answer) window needs a louder start
+                // so the speaker tail can't kick off another turn. Normal turns
+                // stay sensitive, and there is NO hard cap on how long you may
+                // speak — recording ends only after real trailing silence.
+                speechThreshold = if (countdown) 700.0 else 350.0,
+                minSpeechFrames = if (countdown) 5 else 3,
+                // Drain ~0.8s of mic input before listening so the speaker tail
+                // (and the beep) can't be mistaken for the start of a new turn.
+                // Normal turns start immediately — the wake word is the gate.
+                flushMillis = if (countdown) 800 else 0
+            )
         } catch (t: Throwable) {
             Log.e(TAG, "Falha na gravação", t)
             null
@@ -255,19 +268,27 @@ class VoiceService : Service() {
     }
 
     /**
-     * Records the user's utterance (16 kHz mono PCM) until ~1.1s of trailing
-     * silence is detected.
+     * Records the user's utterance (16 kHz mono PCM) until ~0.9s of trailing
+     * silence is detected. There is no short cap on the length of a turn — a
+     * long monologue is captured in full (a 60s safety ceiling only guards
+     * against a stuck stream).
      *
      * @param waitMillis how long to wait for speech to start. After a reply the
      *   caller passes the follow-up window so the conversation can continue
-     *   without repeating the wake word; a short window keeps a stray noise from
-     *   being captured.
+     *   without repeating the wake word.
      * @param onCountdown optional callback invoked once per second with the
      *   remaining seconds, used to update the notification while we wait.
+     * @param speechThreshold RMS above which a frame counts as speech.
+     * @param minSpeechFrames consecutive loud frames needed to start a turn.
+     * @param flushMillis leading milliseconds of mic input to discard before
+     *   listening, so the speaker tail / beep cannot start a new turn.
      */
     private fun recordUtterance(
         waitMillis: Int = 4000,
-        onCountdown: ((Int) -> Unit)? = null
+        onCountdown: ((Int) -> Unit)? = null,
+        speechThreshold: Double = 350.0,
+        minSpeechFrames: Int = 3,
+        flushMillis: Int = 0
     ): ByteArray {
         val sampleRate = SAMPLE_RATE
         val minBuf = AudioRecord.getMinBufferSize(
@@ -287,18 +308,37 @@ class VoiceService : Service() {
 
         val frame = ShortArray(sampleRate / 50) // 20 ms
         val collected = ArrayList<Short>(sampleRate * 8)
-        val maxTotalFrames = 500          // 10 s total
-        val maxSilentFramesAfterSpeech = 1100 / 20 // ~1.1 s
+        // Total capture is bounded only by a generous safety ceiling (60 s), so
+        // a long monologue is never cut off mid-sentence. Recording ends when
+        // ~0.9 s of trailing silence is detected after speech started.
+        val maxTotalFrames = 60 * 50         // hard safety ceiling: 60 s
+        val maxSilentFramesAfterSpeech = 900 / 20 // ~0.9 s of real silence ends the turn
         val maxWaitFrames = (waitMillis / 20).coerceAtLeast(20) // waiting for speech
-        val speechRmsThreshold = 1400.0
+        // Low enough to catch a quiet phone mic (MIUI often records very faint
+        // audio). The follow-up window passes a higher value so the speaker tail
+        // does not start a turn. Note: speech that starts soft but continues
+        // (e.g. after a pause) is still captured — once speechStarted is true we
+        // collect continuously and only a full silence window ends the turn.
+        val speechRmsThreshold = speechThreshold
 
         var speechStarted = false
+        var loudFrames = 0
         var silentFrames = 0
         var waitedFrames = 0
         var frames = 0
 
         rec.startRecording()
         try {
+            // Drain whatever the mic buffered while we were not reading (i.e.
+            // during the post-answer settle), so the speaker tail never lands at
+            // the head of the recording.
+            if (flushMillis > 0) {
+                val flushFrames = (flushMillis / 20).coerceAtLeast(1)
+                var drained = 0
+                while (drained < flushFrames) {
+                    if (rec.read(frame, 0, frame.size) > 0) drained++
+                }
+            }
             while (frames < maxTotalFrames) {
                 val n = rec.read(frame, 0, frame.size)
                 if (n <= 0) continue
@@ -318,11 +358,19 @@ class VoiceService : Service() {
                         onCountdown?.invoke(remaining)
                     }
                     if (rms > speechRmsThreshold) {
-                        speechStarted = true
+                        // Require a few consecutive loud frames so a single click
+                        // or pop does not count as speech.
+                        loudFrames++
+                        if (loudFrames >= minSpeechFrames) {
+                            speechStarted = true
+                        } else {
+                            continue
+                        }
                     } else if (waitedFrames > maxWaitFrames) {
                         // give up: nothing spoken
                         break
                     } else {
+                        loudFrames = 0
                         continue
                     }
                 }
