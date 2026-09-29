@@ -781,6 +781,11 @@ def split_first_chunk(text: str, max_len: int = FIRST_CHUNK_MAX) -> list[str]:
             buf = p
     if buf:
         out.append(buf)
+    # Merge a tiny leading fragment (e.g. "Olá,") into the next piece so the
+    # first chunk is never a 3-4 char blip that sounds chopped. A slightly
+    # longer first chunk is still far cheaper than a second round-trip.
+    if len(out) >= 2 and len(out[0]) < 12 and len(out[0]) + len(out[1]) + 1 <= max_len + 30:
+        out = [f"{out[0]} {out[1]}"] + out[2:]
     return [s for s in out if s]
 
 
