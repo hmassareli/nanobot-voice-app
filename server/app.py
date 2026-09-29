@@ -745,11 +745,12 @@ async def tts_to_mp3_base64(text: str, voice: str | None = None) -> str:
 _SENT_RE = re.compile(r"[^.!?…]+[.!?…]+|\S[^.!?…]*$")
 
 # The very first spoken chunk is what the user actually waits for, so we slice
-# it finer than the rest: Kokoro synthesizes a whole sentence at once and its
-# cost grows with length (measured: 10ch=0.8s, 43ch=2.3s, 112ch=4.4s). Cutting
-# the first sentence into ~70-char pieces makes the first audio land in ~1s
-# instead of ~2.2s, without changing the voice or the model.
-FIRST_CHUNK_MAX = int(os.environ.get("FIRST_CHUNK_MAX", "70"))
+# it finer than the rest. Kokoro has a ~0.9s fixed cost per synthesis call plus
+# ~29ms/char (measured: 15ch=0.9s, 26ch=1.0s, 48ch=1.6s, 87ch=2.7s), so a short
+# opener (~25-30 chars) makes the first audio land in ~1s instead of ~2.2s.
+# Only the leading sentence is sliced; the rest keeps natural boundaries so the
+# prosody stays intact and we don't pay the fixed cost on every fragment.
+FIRST_CHUNK_MAX = int(os.environ.get("FIRST_CHUNK_MAX", "40"))
 
 
 def split_first_chunk(text: str, max_len: int = FIRST_CHUNK_MAX) -> list[str]:
@@ -1213,13 +1214,39 @@ async def ask_stream(request: Request):
             async def producer():
                 nonlocal first_token_ms
                 buf = SentenceBuffer()
+                # Fast path for the very first chunk: emit a short opener as soon
+                # as ~FIRST_CHUNK_MAX chars are available (cut at a comma/space),
+                # instead of waiting for the whole first sentence. This is what
+                # actually moves time-to-first-audio: the LLM's first sentence is
+                # often ~80 chars, and Kokoro costs ~0.9s + 29ms/char, so waiting
+                # for it meant ~2.3s before any sound.
+                head = ""
+                first_emitted = False
                 try:
                     async for piece in stream_agent(text, llm, llm_stats):
                         if first_token_ms is None:
                             first_token_ms = (time.perf_counter() - t_llm) * 1000
                         full_answer.append(piece)
+                        if not first_emitted:
+                            head += piece
+                            if len(head) >= FIRST_CHUNK_MAX:
+                                cut = max(head.rfind(",", 0, FIRST_CHUNK_MAX),
+                                          head.rfind(" ", 0, FIRST_CHUNK_MAX))
+                                if cut <= 0:
+                                    cut = FIRST_CHUNK_MAX
+                                opener = head[:cut + 1].strip()
+                                rest = head[cut + 1:].lstrip()
+                                if opener:
+                                    await queue.put(("sent", opener))
+                                    first_emitted = True
+                                    head = ""
+                                    for sent in buf.feed(rest):
+                                        await queue.put(("sent", sent))
+                            continue
                         for sent in buf.feed(piece):
                             await queue.put(("sent", sent))
+                    if not first_emitted and head.strip():
+                        await queue.put(("sent", head.strip()))
                     for sent in buf.flush():
                         await queue.put(("sent", sent))
                 except Exception as e:  # noqa: BLE001
