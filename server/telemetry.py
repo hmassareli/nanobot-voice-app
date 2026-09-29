@@ -293,7 +293,32 @@ def summarize(turns: list[dict]) -> dict:
         "total_ms": _stat(_vals(real, ("timings", "total_ms"))),
         "request_to_first_audio_ms": _stat(_vals(real, ("client", "request_to_first_audio_ms"))),
         "record_ms": _stat(_vals(real, ("client", "record_ms"))),
+        # Streaming STT proof: how early the first partial transcript landed
+        # (relative to the start of listening) and the end-of-speech → first
+        # audio latency, split by STT mode so the win is visible.
+        "first_partial_ms": _stat(_vals(real, ("client", "first_partial_ms"))),
+        "first_audio_played_ms": _stat(_vals(real, ("client", "first_audio_played_ms"))),
+        "by_stt_mode": _by_stt_mode(real),
     }
+
+
+def _by_stt_mode(turns: list[dict]) -> dict:
+    """Per-STT-mode breakdown ("streaming" vs "audio") of the felt latency."""
+    out: dict[str, dict] = {}
+    for t in turns:
+        mode = (t.get("client") or {}).get("stt_mode") or "unknown"
+        bucket = out.setdefault(mode, {"count": 0, "_played": [], "_partial": []})
+        bucket["count"] += 1
+        played = _get(t, "client", "first_audio_played_ms")
+        if isinstance(played, (int, float)):
+            bucket["_played"].append(played)
+        partial = _get(t, "client", "first_partial_ms")
+        if isinstance(partial, (int, float)):
+            bucket["_partial"].append(partial)
+    for mode, b in out.items():
+        b["first_audio_played_ms"] = _stat(b.pop("_played"))
+        b["first_partial_ms"] = _stat(b.pop("_partial"))
+    return out
 
 
 def phrases(turns: list[dict]) -> list[dict]:

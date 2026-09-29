@@ -181,8 +181,24 @@ class VoiceService : Service() {
      * optionally keeps the conversation going: while the follow-up window is
      * enabled the assistant keeps listening after its reply, so the user does
      * not have to repeat the wake word every single time.
+     *
+     * Two STT strategies are supported (see [Prefs.sttMode]):
+     *  - "streaming": transcribe on-device while the user speaks and send only
+     *    the text (fast path, no audio upload);
+     *  - "audio": record and upload the utterance for server-side Whisper.
+     * The streaming path is used only when the device actually has an on-device
+     * recognizer; otherwise we silently fall back to the audio path.
      */
     private suspend fun handleRequest(ctx: Context) {
+        if (Prefs.sttMode(ctx) == Prefs.STT_MODE_STREAMING && StreamingStt.isAvailable(ctx)) {
+            handleRequestStreaming(ctx)
+        } else {
+            handleRequestAudio(ctx)
+        }
+    }
+
+    /** Audio-upload path: record the utterance, ship it, let the server run STT. */
+    private suspend fun handleRequestAudio(ctx: Context) {
         val rec0 = System.currentTimeMillis()
         var rec: RecordedAudio = recordForRequest(waitMillis = 4000, countdown = false)
             ?: run {
@@ -204,6 +220,272 @@ class VoiceService : Service() {
             rec = recordForRequest(waitMillis = followUpSeconds * 1000, countdown = true)
                 ?: return
             recordMs = System.currentTimeMillis() - rec1
+        }
+    }
+
+    /** On-device streaming path: transcribe while speaking, send only the text. */
+    private suspend fun handleRequestStreaming(ctx: Context) {
+        var turn = streamingTurn(ctx, waitMillis = 4000, countdown = false)
+            ?: run {
+                updateNotification("Não ouvi nada. Tente novamente.")
+                return
+            }
+
+        while (active) {
+            askAndPlayText(ctx, turn)
+            if (!active) return
+
+            val followUpSeconds = Prefs.followUpSeconds(ctx)
+            if (followUpSeconds <= 0) return
+
+            turn = streamingTurn(ctx, waitMillis = followUpSeconds * 1000, countdown = true)
+                ?: return
+        }
+    }
+
+    /** One on-device transcription: the text plus the latency anchors. */
+    private data class StreamedTurn(
+        val text: String,
+        /** Wall-clock instant the final transcript arrived (= end of speech). */
+        val speechEndEpochMs: Long,
+        /** ms from the start of listening to the first partial result, if any. */
+        val firstPartialMs: Long?,
+        /** Wall-clock instant we started listening. */
+        val listenStartEpochMs: Long
+    )
+
+    /**
+     * Listens for one utterance with the on-device recognizer and returns the
+     * final transcript, or null when nothing was said / the wait window expired.
+     * A real recognition failure propagates as an exception so the caller can
+     * decide whether to fall back.
+     */
+    private suspend fun streamingTurn(
+        ctx: Context,
+        waitMillis: Int,
+        countdown: Boolean
+    ): StreamedTurn? {
+        updateNotification(if (countdown) "Ouvindo… pode continuar falando" else "Ouvindo você…")
+        if (!countdown) beep()
+
+        val stt = StreamingStt(ctx, preferOffline = true)
+        val listenStart = System.currentTimeMillis()
+        var firstPartialMs: Long? = null
+        val text = try {
+            stt.start()
+            // The recognizer ends the turn on its own trailing-silence detection;
+            // the timeout is only a safety net (wait window + a generous cap for
+            // a long monologue).
+            stt.listen(timeoutMs = waitMillis.toLong() + 30_000) { partial ->
+                if (firstPartialMs == null) {
+                    firstPartialMs = System.currentTimeMillis() - listenStart
+                }
+                updateNotification(partial.take(80))
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "STT streaming falhou", t)
+            null
+        } finally {
+            stt.release()
+        }
+
+        if (text.isNullOrBlank()) return null
+        return StreamedTurn(text, System.currentTimeMillis(), firstPartialMs, listenStart)
+    }
+
+    /** Sends [rec] to the backend and streams the spoken answer. */
+    private suspend fun askAndPlay(ctx: Context, rec: RecordedAudio, recordMs: Long) {
+        runTurn(
+            ctx = ctx,
+            anchorEpochMs = rec.speechEndEpochMs,
+            recordMs = recordMs,
+            audioFormat = rec.format,
+            audioBytes = rec.bytes.size,
+            sttMode = Prefs.STT_MODE_AUDIO,
+            firstPartialMs = null,
+            send = { onText, onAudioChunk, onTurnId ->
+                NanobotClient(
+                    Prefs.serverUrl(ctx), Prefs.token(ctx), clientId = Prefs.clientId(ctx)
+                ).askStream(
+                    rec.bytes, Prefs.voice(ctx), Prefs.llmModel(ctx),
+                    onText, onAudioChunk, onTurnId, rec.format
+                )
+            }
+        )
+    }
+
+    /** Sends the on-device transcript to the backend and streams the answer. */
+    private suspend fun askAndPlayText(ctx: Context, turn: StreamedTurn) {
+        runTurn(
+            ctx = ctx,
+            anchorEpochMs = turn.speechEndEpochMs,
+            recordMs = turn.speechEndEpochMs - turn.listenStartEpochMs,
+            audioFormat = "text",
+            audioBytes = 0,
+            sttMode = Prefs.STT_MODE_STREAMING,
+            firstPartialMs = turn.firstPartialMs,
+            send = { onText, onAudioChunk, onTurnId ->
+                NanobotClient(
+                    Prefs.serverUrl(ctx), Prefs.token(ctx), clientId = Prefs.clientId(ctx)
+                ).askStreamText(
+                    turn.text, Prefs.voice(ctx), Prefs.llmModel(ctx),
+                    onText, onAudioChunk, onTurnId
+                )
+            }
+        )
+    }
+
+    /**
+     * Runs one turn: streams the reply audio, plays it chunk by chunk and
+     * reports client-side telemetry. [send] performs the actual request and
+     * returns the stream metrics; it is the only part that differs between the
+     * audio and text STT paths.
+     */
+    private suspend fun runTurn(
+        ctx: Context,
+        anchorEpochMs: Long,
+        recordMs: Long,
+        audioFormat: String,
+        audioBytes: Int,
+        sttMode: String,
+        firstPartialMs: Long?,
+        send: (
+            onText: (String) -> Unit,
+            onAudioChunk: (ByteArray) -> Unit,
+            onTurnId: (String) -> Unit
+        ) -> StreamMetrics
+    ) {
+        updateNotification("Pensando…")
+
+        // --- streaming playback -------------------------------------------
+        // The stream reader (IO) pushes each audio chunk into this channel and
+        // never waits for playback. A dedicated worker consumes the channel and
+        // plays the chunks *sequentially* (one MediaPlayer per chunk), starting
+        // with the very first one as soon as it arrives.
+        val audioChunks = Channel<ByteArray>(Channel.UNLIMITED)
+        var startedPlaying = false
+
+        // Client-side playback timings.
+        var firstChunkPlayMs: Long? = null
+        var totalPlayMs: Long? = null
+        val playWindowStart = System.currentTimeMillis()
+        // Exact wall-clock instants for the latency breakdown, all anchored to
+        // the moment the user stopped speaking (anchorEpochMs).
+        var firstAudioReceivedEpochMs = 0L
+        var firstAudioPlayedEpochMs = 0L
+
+        val playerJob = scope.launch {
+            for (chunk in audioChunks) {
+                val chunkStart = System.currentTimeMillis()
+                try {
+                    playAudio(chunk) {
+                        // Fired the instant MediaPlayer.start() returns, i.e. the
+                        // first sample is actually going to the speaker.
+                        if (firstAudioPlayedEpochMs == 0L) {
+                            firstAudioPlayedEpochMs = System.currentTimeMillis()
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Erro ao tocar áudio", t)
+                } finally {
+                    if (firstChunkPlayMs == null) {
+                        // ms from the start of the turn until playback of the
+                        // first chunk actually began (includes network + prep).
+                        firstChunkPlayMs = chunkStart - playWindowStart
+                    }
+                    totalPlayMs = System.currentTimeMillis() - playWindowStart
+                }
+            }
+        }
+
+        var metrics: StreamMetrics? = null
+        var turnId: String? = null
+        // Wall-clock instant we hand the request to the HTTP client. The gap
+        // between this and anchorEpochMs is the local "turnaround" cost
+        // (encoder.finish + multipart build + socket write).
+        val requestSentEpochMs = System.currentTimeMillis()
+        try {
+            metrics = send(
+                { text ->
+                    Log.i(TAG, "Resposta: $text")
+                    updateNotification(text.take(80))
+                },
+                { bytes ->
+                    if (firstAudioReceivedEpochMs == 0L) {
+                        firstAudioReceivedEpochMs = System.currentTimeMillis()
+                    }
+                    if (!startedPlaying) {
+                        startedPlaying = true
+                        updateNotification("Respondendo…")
+                    }
+                    // trySend on an UNLIMITED channel never blocks the reader.
+                    audioChunks.trySend(bytes)
+                },
+                { id -> turnId = id }
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "Erro no backend", t)
+            updateNotification("Erro ao falar com o servidor: ${t.message}")
+        } finally {
+            // Signal end-of-stream so the player worker drains and exits.
+            audioChunks.close()
+            playerJob.join()
+        }
+
+        // --- client-side telemetry (best-effort, never blocks the voice) ---
+        try {
+            val m = metrics
+            val audioDurationMs = when {
+                audioFormat == "text" -> null
+                audioFormat == "wav" -> {
+                    // WAV header is 44 bytes; 16 kHz mono 16-bit => 32 bytes/ms.
+                    val pcm = (audioBytes - 44).coerceAtLeast(0)
+                    if (pcm > 0) pcm / 32.0 else null
+                }
+                else -> {
+                    // Compressed: estimate from the codec bitrate (Opus 24k / AAC 24k).
+                    if (audioBytes > 0) audioBytes * 8.0 / 24.0 else null
+                }
+            }
+            val payload = JSONObject().apply {
+                turnId?.let { put("turn_id", it) }
+                    ?: m?.turnId?.let { put("turn_id", it) }
+                put("stt_mode", sttMode)
+                put("record_ms", recordMs)
+                put("audio_format", audioFormat)
+                put("audio_bytes", audioBytes)
+                put("audio_duration_ms", audioDurationMs)
+                put("request_to_first_audio_ms", m?.firstAudioMs ?: JSONObject.NULL)
+                put("first_chunk_play_ms", firstChunkPlayMs ?: JSONObject.NULL)
+                put("total_play_ms", totalPlayMs ?: JSONObject.NULL)
+                put("chunks", m?.chunks ?: 0)
+                // --- exact latency breakdown, anchored to end-of-speech ---
+                // All values are ms elapsed since the recognizer/VAD decided the
+                // user had stopped talking. This is the number the user feels.
+                if (anchorEpochMs > 0) {
+                    put("speech_end_epoch_ms", anchorEpochMs)
+                    put("request_sent_ms", requestSentEpochMs - anchorEpochMs)
+                    if (firstAudioReceivedEpochMs > 0) {
+                        put("first_audio_received_ms", firstAudioReceivedEpochMs - anchorEpochMs)
+                    }
+                    if (firstAudioPlayedEpochMs > 0) {
+                        put("first_audio_played_ms", firstAudioPlayedEpochMs - anchorEpochMs)
+                    }
+                }
+                // Proof of the streaming win: how early the first partial landed
+                // relative to the start of listening (negative = before the user
+                // finished speaking).
+                firstPartialMs?.let { put("first_partial_ms", it) }
+                put("app_version", BuildConfig.VERSION_NAME)
+                put("device_model", Build.MODEL)
+                put("android_sdk", Build.VERSION.SDK_INT)
+                put("network", networkType(ctx))
+            }
+            NanobotClient(Prefs.serverUrl(ctx), Prefs.token(ctx)).report(
+                Prefs.clientId(ctx), Prefs.token(ctx), payload
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Telemetria ignorada: ${t.message}")
         }
     }
 
@@ -235,138 +517,6 @@ class VoiceService : Service() {
         return rec?.takeIf { it.bytes.size >= 3200 }
     }
 
-    /** Sends [rec] to the backend and streams the spoken answer. */
-    private suspend fun askAndPlay(ctx: Context, rec: RecordedAudio, recordMs: Long) {
-        val wav = rec.bytes
-        updateNotification("Pensando…")
-
-        // --- streaming playback -------------------------------------------
-        // The stream reader (IO) pushes each audio chunk into this channel and
-        // never waits for playback. A dedicated worker consumes the channel and
-        // plays the chunks *sequentially* (one MediaPlayer per chunk), starting
-        // with the very first one as soon as it arrives.
-        val audioChunks = Channel<ByteArray>(Channel.UNLIMITED)
-        var startedPlaying = false
-
-        // Client-side playback timings.
-        var firstChunkPlayMs: Long? = null
-        var totalPlayMs: Long? = null
-        val playWindowStart = System.currentTimeMillis()
-        // Exact wall-clock instants for the latency breakdown, all anchored to
-        // the moment the user stopped speaking (rec.speechEndEpochMs).
-        var firstAudioReceivedEpochMs = 0L
-        var firstAudioPlayedEpochMs = 0L
-
-        val playerJob = scope.launch {
-            for (chunk in audioChunks) {
-                val chunkStart = System.currentTimeMillis()
-                try {
-                    playAudio(chunk) {
-                        // Fired the instant MediaPlayer.start() returns, i.e. the
-                        // first sample is actually going to the speaker.
-                        if (firstAudioPlayedEpochMs == 0L) {
-                            firstAudioPlayedEpochMs = System.currentTimeMillis()
-                        }
-                    }
-                } catch (t: Throwable) {
-                    Log.e(TAG, "Erro ao tocar áudio", t)
-                } finally {
-                    if (firstChunkPlayMs == null) {
-                        // ms from the start of the turn until playback of the
-                        // first chunk actually began (includes network + prep).
-                        firstChunkPlayMs = chunkStart - playWindowStart
-                    }
-                    totalPlayMs = System.currentTimeMillis() - playWindowStart
-                }
-            }
-        }
-
-        var metrics: StreamMetrics? = null
-        var turnId: String? = null
-        // Wall-clock instant we hand the request to the HTTP client. The gap
-        // between this and rec.speechEndEpochMs is the local "turnaround" cost
-        // (encoder.finish + multipart build + socket write).
-        val requestSentEpochMs = System.currentTimeMillis()
-        try {
-            metrics = NanobotClient(
-                Prefs.serverUrl(ctx), Prefs.token(ctx), clientId = Prefs.clientId(ctx)
-            ).askStream(
-                wav, Prefs.voice(ctx), Prefs.llmModel(ctx),
-                onText = { text ->
-                    Log.i(TAG, "Resposta: $text")
-                    updateNotification(text.take(80))
-                },
-                onAudioChunk = { bytes ->
-                    if (firstAudioReceivedEpochMs == 0L) {
-                        firstAudioReceivedEpochMs = System.currentTimeMillis()
-                    }
-                    if (!startedPlaying) {
-                        startedPlaying = true
-                        updateNotification("Respondendo…")
-                    }
-                    // trySend on an UNLIMITED channel never blocks the reader.
-                    audioChunks.trySend(bytes)
-                },
-                onTurnId = { id -> turnId = id },
-                audioFormat = rec.format
-            )
-        } catch (t: Throwable) {
-            Log.e(TAG, "Erro no backend", t)
-            updateNotification("Erro ao falar com o servidor: ${t.message}")
-        } finally {
-            // Signal end-of-stream so the player worker drains and exits.
-            audioChunks.close()
-            playerJob.join()
-        }
-
-        // --- client-side telemetry (best-effort, never blocks the voice) ---
-        try {
-            val m = metrics
-            val audioDurationMs = if (rec.format == "wav") {
-                // WAV header is 44 bytes; 16 kHz mono 16-bit => 32 bytes/ms.
-                val pcm = (wav.size - 44).coerceAtLeast(0)
-                if (pcm > 0) pcm / 32.0 else null
-            } else {
-                // Compressed: estimate from the codec bitrate (Opus 24k / AAC 24k).
-                if (wav.isNotEmpty()) wav.size * 8.0 / 24.0 else null
-            }
-            val payload = JSONObject().apply {
-                turnId?.let { put("turn_id", it) }
-                    ?: m?.turnId?.let { put("turn_id", it) }
-                put("record_ms", recordMs)
-                put("audio_format", rec.format)
-                put("audio_bytes", wav.size)
-                put("audio_duration_ms", audioDurationMs)
-                put("request_to_first_audio_ms", m?.firstAudioMs ?: JSONObject.NULL)
-                put("first_chunk_play_ms", firstChunkPlayMs ?: JSONObject.NULL)
-                put("total_play_ms", totalPlayMs ?: JSONObject.NULL)
-                put("chunks", m?.chunks ?: 0)
-                // --- exact latency breakdown, anchored to end-of-speech ---
-                // All values are ms elapsed since the VAD decided the user had
-                // stopped talking. This is the number the user actually feels.
-                val anchor = rec.speechEndEpochMs
-                if (anchor > 0) {
-                    put("speech_end_epoch_ms", anchor)
-                    put("request_sent_ms", requestSentEpochMs - anchor)
-                    if (firstAudioReceivedEpochMs > 0) {
-                        put("first_audio_received_ms", firstAudioReceivedEpochMs - anchor)
-                    }
-                    if (firstAudioPlayedEpochMs > 0) {
-                        put("first_audio_played_ms", firstAudioPlayedEpochMs - anchor)
-                    }
-                }
-                put("app_version", BuildConfig.VERSION_NAME)
-                put("device_model", Build.MODEL)
-                put("android_sdk", Build.VERSION.SDK_INT)
-                put("network", networkType(ctx))
-            }
-            NanobotClient(Prefs.serverUrl(ctx), Prefs.token(ctx)).report(
-                Prefs.clientId(ctx), Prefs.token(ctx), payload
-            )
-        } catch (t: Throwable) {
-            Log.w(TAG, "Telemetria ignorada: ${t.message}")
-        }
-    }
 
     /** Best-effort connectivity label for telemetry: "wifi", "mobile" or "none". */
     private fun networkType(ctx: Context): String {

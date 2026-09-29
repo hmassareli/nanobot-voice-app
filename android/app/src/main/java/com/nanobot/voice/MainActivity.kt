@@ -42,6 +42,7 @@ class MainActivity : Activity() {
     private lateinit var token: EditText
     private lateinit var voiceSpinner: Spinner
     private lateinit var followUpSpinner: Spinner
+    private lateinit var sttSpinner: Spinner
     private lateinit var wakeWord: EditText
     private lateinit var llmModel: EditText
     private lateinit var status: TextView
@@ -105,6 +106,16 @@ class MainActivity : Activity() {
             )
         }
         root.addView(followUpSpinner)
+
+        root.addView(label("Reconhecimento de fala (STT)"))
+        sttSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                Prefs.STT_MODE_LABELS
+            )
+        }
+        root.addView(sttSpinner)
 
         llmModel = field("Modelo LLM", Prefs.DEFAULT_LLM_MODEL, InputType.TYPE_CLASS_TEXT)
         root.addView(label("Modelo LLM"))
@@ -193,12 +204,17 @@ class MainActivity : Activity() {
         if (idx >= 0) voiceSpinner.setSelection(idx)
         val fIdx = Prefs.FOLLOW_UP_VALUES.indexOf(Prefs.followUpSeconds(this))
         if (fIdx >= 0) followUpSpinner.setSelection(fIdx)
+        val sIdx = Prefs.STT_MODE_VALUES.indexOf(Prefs.sttMode(this))
+        if (sIdx >= 0) sttSpinner.setSelection(sIdx)
     }
 
     private fun savePrefs() {
         val voiceKey = Prefs.VOICE_KEYS.getOrElse(voiceSpinner.selectedItemPosition) { Prefs.DEFAULT_VOICE }
         val followUp = Prefs.FOLLOW_UP_VALUES.getOrElse(followUpSpinner.selectedItemPosition) {
             Prefs.DEFAULT_FOLLOW_UP_SECONDS
+        }
+        val sttMode = Prefs.STT_MODE_VALUES.getOrElse(sttSpinner.selectedItemPosition) {
+            Prefs.DEFAULT_STT_MODE
         }
         Prefs.get(this).edit()
             .putString(Prefs.KEY_SERVER_URL, serverUrl.text.toString().trim())
@@ -207,6 +223,7 @@ class MainActivity : Activity() {
             .putString(Prefs.KEY_WAKE_WORD, wakeWord.text.toString().trim())
             .putString(Prefs.KEY_LLM_MODEL, llmModel.text.toString().trim())
             .putInt(Prefs.KEY_FOLLOW_UP, followUp)
+            .putString(Prefs.KEY_STT_MODE, sttMode)
             .apply()
         toast("Configurações salvas")
         setStatus("Configurações salvas.")

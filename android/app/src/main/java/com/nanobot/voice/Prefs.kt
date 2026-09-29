@@ -18,6 +18,7 @@ object Prefs {
     const val KEY_LLM_MODEL = "llm_model"
     const val KEY_ENABLED = "service_enabled"
     const val KEY_FOLLOW_UP = "follow_up_seconds"
+    const val KEY_STT_MODE = "stt_mode"
 
     /** Persisted stable id sent to the backend as the `X-Client-Id` header. */
     const val KEY_CLIENT_ID = "client_id"
@@ -36,6 +37,24 @@ object Prefs {
      * repeating the wake word every time. 0 disables the follow-up window.
      */
     const val DEFAULT_FOLLOW_UP_SECONDS = 8
+
+    /**
+     * Speech-to-text strategy:
+     *  - "streaming": transcribe on-device while the user speaks (SpeechRecognizer)
+     *    and send only the text to the server. Removes the ~1-2s STT leg.
+     *  - "audio": record the utterance and upload it; the server runs Whisper.
+     *    Kept as a fallback for devices without an on-device recognizer.
+     */
+    const val STT_MODE_STREAMING = "streaming"
+    const val STT_MODE_AUDIO = "audio"
+    const val DEFAULT_STT_MODE = STT_MODE_STREAMING
+
+    /** Pick-list for the "reconhecimento de fala" spinner: label -> mode. */
+    val STT_MODE_LABELS = listOf(
+        "No aparelho (rápido, streaming)",
+        "No servidor (Whisper, upload de áudio)"
+    )
+    val STT_MODE_VALUES = listOf(STT_MODE_STREAMING, STT_MODE_AUDIO)
 
     /** Pick-list for the "seguir ouvindo" spinner: label -> seconds. */
     val FOLLOW_UP_LABELS = listOf(
@@ -93,6 +112,10 @@ object Prefs {
     fun followUpSeconds(ctx: Context): Int = get(ctx)
         .getInt(KEY_FOLLOW_UP, DEFAULT_FOLLOW_UP_SECONDS)
         .coerceAtLeast(0)
+
+    /** STT strategy: "streaming" (on-device) or "audio" (server Whisper). */
+    fun sttMode(ctx: Context): String =
+        get(ctx).getString(KEY_STT_MODE, DEFAULT_STT_MODE) ?: DEFAULT_STT_MODE
 
     /**
      * Stable, device-unique client id used for telemetry (the backend groups

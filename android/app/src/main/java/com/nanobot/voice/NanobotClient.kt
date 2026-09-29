@@ -162,6 +162,59 @@ class NanobotClient(
         onAudioChunk: (ByteArray) -> Unit,
         onTurnId: ((String) -> Unit)? = null,
         audioFormat: String = "wav"
+    ): StreamMetrics = streamRequest(
+        buildMultipart(audioBytes, voice, llmModel, audioFormat),
+        onText, onAudioChunk, onTurnId
+    ) { fallback ->
+        // Old server without /ask_stream — fall back to the plain endpoint.
+        val result = ask(audioBytes, voice, llmModel, audioFormat)
+        if (result.text.isNotBlank()) onText(result.text)
+        if (result.audio.isNotEmpty()) fallback(result.audio)
+        result.turnId
+    }
+
+    /**
+     * Text variant of [askStream]: the phone already transcribed the utterance
+     * on-device, so we POST JSON `{"text": ...}` instead of an audio file. The
+     * server skips STT entirely (`stt_ms = 0`), which is the whole point of the
+     * streaming mode. Response handling is identical to [askStream].
+     */
+    @Throws(IOException::class)
+    fun askStreamText(
+        text: String,
+        voice: String,
+        llmModel: String?,
+        onText: (String) -> Unit,
+        onAudioChunk: (ByteArray) -> Unit,
+        onTurnId: ((String) -> Unit)? = null
+    ): StreamMetrics {
+        val json = JSONObject().apply {
+            put("text", text)
+            put("voice", voice)
+            if (!llmModel.isNullOrBlank()) put("llm", llmModel)
+        }
+        val body = json.toString().toRequestBody("application/json".toMediaType())
+        return streamRequest(body, onText, onAudioChunk, onTurnId) { fallback ->
+            // No /ask_stream: use the non-streaming /ask with the same JSON body.
+            val result = askJson(json)
+            if (result.text.isNotBlank()) onText(result.text)
+            if (result.audio.isNotEmpty()) fallback(result.audio)
+            result.turnId
+        }
+    }
+
+    /**
+     * Shared NDJSON reader for both the audio and text streaming paths. [body]
+     * is the already-built request body; [onFallback] is invoked when the server
+     * answers 404 (endpoint missing) and must return the turn id, if any.
+     */
+    @Throws(IOException::class)
+    private fun streamRequest(
+        body: okhttp3.RequestBody,
+        onText: (String) -> Unit,
+        onAudioChunk: (ByteArray) -> Unit,
+        onTurnId: ((String) -> Unit)?,
+        onFallback: (noteChunk: (ByteArray) -> Unit) -> String?
     ): StreamMetrics {
         val t0 = System.currentTimeMillis()
         var firstAudioMs: Long? = null
@@ -178,7 +231,7 @@ class NanobotClient(
 
         val reqBuilder = Request.Builder()
             .url("$baseUrl/ask_stream")
-            .post(buildMultipart(audioBytes, voice, llmModel, audioFormat))
+            .post(body)
         if (token.isNotBlank()) {
             reqBuilder.header("Authorization", "Bearer $token")
         }
@@ -188,13 +241,10 @@ class NanobotClient(
 
         http.newCall(reqBuilder.build()).execute().use { resp ->
             if (resp.code == 404) {
-                // Old server without /ask_stream — fall back to the plain endpoint.
                 Log.w("NanobotClient", "/ask_stream ausente (404) — usando /ask")
-                val result = ask(audioBytes, voice, llmModel, audioFormat)
-                if (result.text.isNotBlank()) onText(result.text)
-                if (result.audio.isNotEmpty()) noteChunk(result.audio)
-                result.turnId?.let { onTurnId?.invoke(it) }
-                return StreamMetrics(result.turnId, firstAudioMs, chunks, receivedBytes, t0)
+                val id = onFallback(::noteChunk)
+                id?.let { onTurnId?.invoke(it) }
+                return StreamMetrics(id, firstAudioMs, chunks, receivedBytes, t0)
             }
             if (!resp.isSuccessful) {
                 val bodyStr = resp.body?.string().orEmpty()
@@ -244,6 +294,36 @@ class NanobotClient(
             }
         }
         return StreamMetrics(turnId, firstAudioMs, chunks, receivedBytes, t0)
+    }
+
+    /** Non-streaming POST of a JSON body to `/ask`. */
+    @Throws(IOException::class)
+    private fun askJson(json: JSONObject): AskResult {
+        val reqBuilder = Request.Builder()
+            .url("$baseUrl/ask")
+            .post(json.toString().toRequestBody("application/json".toMediaType()))
+        if (token.isNotBlank()) reqBuilder.header("Authorization", "Bearer $token")
+        if (!clientId.isNullOrBlank()) reqBuilder.header("X-Client-Id", clientId)
+        http.newCall(reqBuilder.build()).execute().use { resp ->
+            val bodyStr = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}: ${bodyStr.take(300)}")
+            if (bodyStr.isBlank()) return AskResult("", ByteArray(0))
+            val obj = JSONObject(bodyStr)
+            val text = obj.optString("text", "")
+            val turnId = obj.optString("turn_id", "").takeIf { it.isNotBlank() }
+            val b64 = obj.optString("audio_base64", "")
+            val audio = if (b64.isNotBlank()) {
+                try {
+                    android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                } catch (t: Throwable) {
+                    Log.e("NanobotClient", "audio_base64 inválido", t)
+                    ByteArray(0)
+                }
+            } else {
+                ByteArray(0)
+            }
+            return AskResult(text, audio, turnId)
+        }
     }
 
     /**
