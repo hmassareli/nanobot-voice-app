@@ -33,6 +33,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 
 import re
@@ -112,6 +113,8 @@ def build_system_prompt() -> str:
         "Você é o nanobot, um assistente pessoal de voz. Responda em português do "
         "Brasil, de forma concisa e falada (frases curtas, sem markdown, sem listas, "
         "sem emojis). Suas respostas serão convertidas em áudio.",
+        "O usuário fala por voz. NUNCA peça para ele 'escrever' ou 'mandar por "
+        "texto'. Se algo não ficou claro, peça para repetir em voz alta.",
         "Você tem acesso ao workspace do assistente com ferramentas: read_file, "
         "list_dir e exec (shell). Use-as quando precisar consultar arquivos ou o "
         "ambiente. Caminhos são relativos ao workspace.",
@@ -376,15 +379,21 @@ def _get_whisper_model():
 
 
 async def transcribe_audio(path: str) -> str:
-    """Groq Whisper (if GROQ_API_KEY) -> faster-whisper local (singleton)."""
+    """Groq Whisper (if GROQ_API_KEY) -> faster-whisper local (singleton).
+
+    Phone mics (especially MIUI) often capture very quiet audio. We peak-normalise
+    the WAV first so a faint recording is not silently discarded by Whisper's
+    internal silence detection.
+    """
+    norm_path = _normalize_wav(path)
     if GROQ_API_KEY:
         try:
             async with httpx.AsyncClient() as client:
-                with open(path, "rb") as f:
+                with open(norm_path, "rb") as f:
                     resp = await client.post(
                         "https://api.groq.com/openai/v1/audio/transcriptions",
                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                        files={"file": (Path(path).name, f), "model": (None, "whisper-large-v3-turbo")},
+                        files={"file": (Path(norm_path).name, f), "model": (None, "whisper-large-v3-turbo")},
                         timeout=60,
                     )
                 resp.raise_for_status()
@@ -397,13 +406,55 @@ async def transcribe_audio(path: str) -> str:
     try:
         def _whisper() -> str:
             model = _get_whisper_model()
-            segments, _ = model.transcribe(path, language=WHISPER_LANGUAGE, vad_filter=True)
+            # No vad_filter: VAD drops quiet/short speech, which is exactly the
+            # case we are trying to recover here.
+            segments, _ = model.transcribe(
+                norm_path,
+                language=WHISPER_LANGUAGE,
+                vad_filter=False,
+                no_speech_threshold=0.9,
+                condition_on_previous_text=False,
+            )
             return " ".join(s.text.strip() for s in segments).strip()
 
         return await asyncio.to_thread(_whisper)
     except Exception as e:  # noqa: BLE001
         log.warning("Local whisper transcription failed: %s", e)
         return ""
+
+
+def _normalize_wav(path: str) -> str:
+    """Peak-normalise a 16-bit WAV to ~0.9 full-scale. Returns the new path
+    (the original path when normalisation is not needed/possible)."""
+    try:
+        import numpy as np
+
+        with wave.open(path, "rb") as w:
+            sr, ch, sw, n = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
+            data = w.readframes(n)
+        if sw != 2 or n == 0:
+            return path
+        x = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+        peak = float(np.max(np.abs(x)))
+        if peak < 1.0:
+            return path
+        if peak >= 32000:  # already loud enough
+            return path
+        gain = min(32000.0 / peak, 12.0)  # cap the boost at ~+21 dB
+        if gain <= 1.2:
+            return path
+        y = np.clip(x * gain, -32768, 32767).astype(np.int16)
+        out = tempfile.mktemp(suffix=".wav")
+        with wave.open(out, "wb") as w:
+            w.setnchannels(ch)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(y.tobytes())
+        log.info("Normalised %s (peak=%d, gain=%.2f)", Path(path).name, int(peak), gain)
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning("normalise failed: %s", e)
+        return path
 
 
 # --- TTS -------------------------------------------------------------------
@@ -662,7 +713,16 @@ async def ask(request: Request):
 
     text, stt_ms, voice, llm = await _parse_input(request)
     if not text:
-        text = "(não entendi o áudio)"
+        # Nothing intelligible was captured. Answer directly instead of feeding a
+        # placeholder into the LLM (which used to produce "manda por texto").
+        msg = "Não consegui te ouvir direito. Pode repetir, por favor?"
+        audio_b64 = await tts_to_mp3_base64(msg, voice) if voice else ""
+        return {
+            "text": msg,
+            "audio_base64": audio_b64,
+            "timings": {"stt_ms": round(stt_ms, 1)},
+            "stt_failed": True,
+        }
 
     log.info("ask text=%r voice=%r llm=%r", text[:200], voice, llm)
 
@@ -708,12 +768,36 @@ async def ask_stream(request: Request):
     if not _authed(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
+    # IMPORTANT: read the request body HERE, before returning the
+    # StreamingResponse. Reading it inside the generator deadlocks: once the
+    # response has started, Starlette no longer drains the request body, so
+    # `await request.json()` / `request.form()` blocks forever (the client sees
+    # a 200 with zero bytes and eventually times out). /ask worked only because
+    # it parses the body before responding.
+    text, stt_ms, voice, llm = await _parse_input(request)
+
     async def gen():
         t_start = time.perf_counter()
         try:
-            text, stt_ms, voice, llm = await _parse_input(request)
             if not text:
-                text = "(não entendi o áudio)"
+                # Nothing intelligible captured — emit a short spoken apology
+                # instead of pushing a placeholder through the LLM.
+                msg = "Não consegui te ouvir direito. Pode repetir, por favor?"
+                audio = await tts_to_mp3_base64(msg, voice) if voice else b""
+                if audio:
+                    yield json.dumps({
+                        "type": "audio",
+                        "data": base64.b64encode(audio).decode(),
+                        "index": 0,
+                        "text": msg,
+                    }) + "\n"
+                yield json.dumps({"type": "text", "text": msg}) + "\n"
+                yield json.dumps({
+                    "type": "done",
+                    "timings": {"stt_ms": round(stt_ms, 1)},
+                    "stt_failed": True,
+                }) + "\n"
+                return
             log.info("ask_stream text=%r voice=%r llm=%r", text[:200], voice, llm)
 
             t_llm = time.perf_counter()

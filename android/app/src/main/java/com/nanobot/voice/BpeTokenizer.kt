@@ -23,6 +23,14 @@ object BpeTokenizer {
     private const val WORD_MARK = '\u2581'
     private val UNK: String get() = BpeVocab.PIECES[2]
 
+    /**
+     * Characters that are not in the model's vocabulary (tokens.txt has no
+     * punctuation except "-"). If they reach the tokenizer they become `<unk>`,
+     * and a keyword line containing `<unk>` matches *nothing* — the spotter
+     * builds a stream but never fires. So we strip them before encoding.
+     */
+    private val NOISE = Regex("[^A-Z0-9 '-]")
+
     /** piece string -> id, built once. */
     private val ids: Map<String, Int> by lazy {
         HashMap<String, Int>(BpeVocab.SIZE * 2).apply {
@@ -33,11 +41,16 @@ object BpeTokenizer {
     /**
      * Tokenises [text] into sentencepiece pieces.
      *
+     * Punctuation (e.g. the "!" in "OPA, AMIGO!") is dropped first: it is not in
+     * the KWS vocabulary and would otherwise poison the whole keyword line with
+     * `<unk>`, silently disabling detection.
+     *
      * @return the pieces in order, or `null` when the text is empty.
      */
     fun encode(text: String): List<String>? {
-        val words = text.trim().uppercase()
-            .split(Regex("\\s+"))
+        val cleaned = text.uppercase().replace(NOISE, " ")
+        val words = cleaned.split(Regex("\\s+"))
+            .map { it.trim('\'') }
             .filter { it.isNotEmpty() }
         if (words.isEmpty()) return null
 

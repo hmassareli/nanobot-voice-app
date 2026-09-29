@@ -85,7 +85,10 @@ class SherpaWakeWordEngine(
         val modelConfig = OnlineModelConfig(
             transducer = transducer,
             tokens = "kws/tokens.txt",
-            numThreads = 2,
+            // 1 thread: with 2 threads the tiny 3.3M model burns ~4x the CPU for
+            // no accuracy gain (measured 18.9% vs 4.9% of one core for 60 s of
+            // audio). The wake word path must stay cheap — it runs 24/7.
+            numThreads = 1,
             debug = false,
             provider = "cpu",
             modelType = "zipformer2",
@@ -181,6 +184,20 @@ class SherpaWakeWordEngine(
         worker?.join(1500)
         worker = null
         isRunning = false
+        // CRITICAL: actually stop and release the AudioRecord. Without this the
+        // KWS recorder keeps holding the microphone, so the AudioRecord opened
+        // right after (to capture the user's utterance) gets muted/silent audio
+        // on most devices -> the backend receives an empty clip and replies
+        // "não consegui te ouvir direito".
+        try {
+            record?.stop()
+        } catch (_: Throwable) {
+        }
+        try {
+            record?.release()
+        } catch (_: Throwable) {
+        }
+        record = null
     }
 
     override fun release() {
