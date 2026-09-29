@@ -42,8 +42,15 @@ import kotlinx.coroutines.launch
 class VoiceService : Service() {
 
     /** One recorded utterance: the bytes to upload plus their container format
-     *  ("opus", "aac" or "wav"). */
-    private data class RecordedAudio(val bytes: ByteArray, val format: String)
+     *  ("opus", "aac" or "wav"). [speechEndEpochMs] is the wall-clock instant the
+     *  VAD decided the user had stopped talking — the anchor for every latency
+     *  measurement downstream (request sent, first audio received, first audio
+     *  actually played). 0 when unknown. */
+    private data class RecordedAudio(
+        val bytes: ByteArray,
+        val format: String,
+        val speechEndEpochMs: Long = 0L
+    )
 
     companion object {
         const val TAG = "VoiceService"
@@ -245,12 +252,22 @@ class VoiceService : Service() {
         var firstChunkPlayMs: Long? = null
         var totalPlayMs: Long? = null
         val playWindowStart = System.currentTimeMillis()
+        // Exact wall-clock instants for the latency breakdown, all anchored to
+        // the moment the user stopped speaking (rec.speechEndEpochMs).
+        var firstAudioReceivedEpochMs = 0L
+        var firstAudioPlayedEpochMs = 0L
 
         val playerJob = scope.launch {
             for (chunk in audioChunks) {
                 val chunkStart = System.currentTimeMillis()
                 try {
-                    playAudio(chunk)
+                    playAudio(chunk) {
+                        // Fired the instant MediaPlayer.start() returns, i.e. the
+                        // first sample is actually going to the speaker.
+                        if (firstAudioPlayedEpochMs == 0L) {
+                            firstAudioPlayedEpochMs = System.currentTimeMillis()
+                        }
+                    }
                 } catch (t: Throwable) {
                     Log.e(TAG, "Erro ao tocar áudio", t)
                 } finally {
@@ -266,6 +283,10 @@ class VoiceService : Service() {
 
         var metrics: StreamMetrics? = null
         var turnId: String? = null
+        // Wall-clock instant we hand the request to the HTTP client. The gap
+        // between this and rec.speechEndEpochMs is the local "turnaround" cost
+        // (encoder.finish + multipart build + socket write).
+        val requestSentEpochMs = System.currentTimeMillis()
         try {
             metrics = NanobotClient(
                 Prefs.serverUrl(ctx), Prefs.token(ctx), clientId = Prefs.clientId(ctx)
@@ -276,6 +297,9 @@ class VoiceService : Service() {
                     updateNotification(text.take(80))
                 },
                 onAudioChunk = { bytes ->
+                    if (firstAudioReceivedEpochMs == 0L) {
+                        firstAudioReceivedEpochMs = System.currentTimeMillis()
+                    }
                     if (!startedPlaying) {
                         startedPlaying = true
                         updateNotification("Respondendo…")
@@ -317,6 +341,20 @@ class VoiceService : Service() {
                 put("first_chunk_play_ms", firstChunkPlayMs ?: JSONObject.NULL)
                 put("total_play_ms", totalPlayMs ?: JSONObject.NULL)
                 put("chunks", m?.chunks ?: 0)
+                // --- exact latency breakdown, anchored to end-of-speech ---
+                // All values are ms elapsed since the VAD decided the user had
+                // stopped talking. This is the number the user actually feels.
+                val anchor = rec.speechEndEpochMs
+                if (anchor > 0) {
+                    put("speech_end_epoch_ms", anchor)
+                    put("request_sent_ms", requestSentEpochMs - anchor)
+                    if (firstAudioReceivedEpochMs > 0) {
+                        put("first_audio_received_ms", firstAudioReceivedEpochMs - anchor)
+                    }
+                    if (firstAudioPlayedEpochMs > 0) {
+                        put("first_audio_played_ms", firstAudioPlayedEpochMs - anchor)
+                    }
+                }
                 put("app_version", BuildConfig.VERSION_NAME)
                 put("device_model", Build.MODEL)
                 put("android_sdk", Build.VERSION.SDK_INT)
@@ -407,6 +445,10 @@ class VoiceService : Service() {
         var silentFrames = 0
         var waitedFrames = 0
         var frames = 0
+        // Wall-clock instant the trailing-silence window closed (i.e. the moment
+        // we decided the user stopped speaking). This is the anchor for all
+        // downstream latency numbers.
+        var speechEndEpochMs = 0L
 
         rec.startRecording()
         // Encode in parallel with recording so the compressed audio is ready the
@@ -470,7 +512,10 @@ class VoiceService : Service() {
                         silentFrames = 0
                     } else {
                         silentFrames++
-                        if (silentFrames > maxSilentFramesAfterSpeech) break
+                        if (silentFrames > maxSilentFramesAfterSpeech) {
+                            speechEndEpochMs = System.currentTimeMillis()
+                            break
+                        }
                     }
                 }
             }
@@ -491,13 +536,13 @@ class VoiceService : Service() {
         // Prefer the audio encoded live during recording; fall back to raw WAV.
         val encoded = encoder.finish()
         if (encoded.bytes.isNotEmpty() && encoded.format != "wav") {
-            return RecordedAudio(encoded.bytes, encoded.format)
+            return RecordedAudio(encoded.bytes, encoded.format, speechEndEpochMs)
         }
         // trim a little leading/trailing silence
-        return RecordedAudio(WavUtil.encode(samples, sampleRate), "wav")
+        return RecordedAudio(WavUtil.encode(samples, sampleRate), "wav", speechEndEpochMs)
     }
 
-    private fun playAudio(bytes: ByteArray) {
+    private fun playAudio(bytes: ByteArray, onStarted: (() -> Unit)? = null) {
         val tmp = File(cacheDir, "reply_${System.currentTimeMillis()}_${(Math.random() * 1e6).toInt()}.ogg")
         tmp.writeBytes(bytes)
         val player = MediaPlayer()
@@ -519,6 +564,9 @@ class VoiceService : Service() {
                 true
             }
             player.start()
+            // start() returns once playback has begun; this is the closest we get
+            // to "the first sample left the speaker".
+            onStarted?.invoke()
             synchronized(done) {
                 try {
                     done.wait(120_000)

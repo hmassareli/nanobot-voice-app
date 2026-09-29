@@ -1034,6 +1034,7 @@ async def _parse_input(request: Request) -> tuple[str, float, str | None, str | 
 @app.post("/ask")
 async def ask(request: Request):
     t_start = time.perf_counter()
+    t_start_epoch_ms = int(time.time() * 1000)
     if not _authed(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
@@ -1064,6 +1065,7 @@ async def ask(request: Request):
             "timings": {
                 "first_audio_ms": round(first_audio_ms, 1) if first_audio_ms else None,
                 "total_ms": round((time.perf_counter() - t_start) * 1000, 1),
+                "request_received_epoch_ms": t_start_epoch_ms,
             },
         })
 
@@ -1162,6 +1164,10 @@ async def ask_stream(request: Request):
 
     async def gen():
         t_start = time.perf_counter()
+        # Wall-clock anchor so the client's end-of-speech timestamp can be
+        # stitched to the server timeline (network + queueing = request_received
+        # minus the client's request_sent).
+        t_start_epoch_ms = int(time.time() * 1000)
         try:
             if not text:
                 # Nothing intelligible captured — emit a short spoken apology
@@ -1309,6 +1315,7 @@ async def ask_stream(request: Request):
                 "first_token_ms": round(first_token_ms, 1) if first_token_ms else None,
                 "first_audio_ms": round(first_audio_ms, 1) if first_audio_ms else None,
                 "sentences": index,
+                "request_received_epoch_ms": t_start_epoch_ms,
             }
             log.info(
                 "TIMING(stream) turn=%s stt=%.0fms llm=%.0fms tts=%.0fms total=%.0fms "
