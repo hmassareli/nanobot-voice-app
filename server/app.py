@@ -660,6 +660,42 @@ def _normalize_wav(path: str) -> str:
 # The client is unchanged either way.
 _KPIPE = None  # lazy-loaded Kokoro pipeline (heavy import + model download)
 
+# Dedicated single-worker executor for Kokoro.
+#
+# WHY: torch/OpenMP binds its thread pool to the *first* thread that runs the
+# model. When we called Kokoro via `asyncio.to_thread`, it ran on a generic
+# ThreadPoolExecutor worker, and OpenMP ended up using only ~2 of the 6 cores
+# (measured cpu/wall ≈ 2.0 vs 5.9 on the main thread) — turning a 1.2s
+# synthesis into ~4.3s. Running it on a dedicated executor whose worker thread
+# is warmed up *inside itself* restores full parallelism (cpu/wall ≈ 5.2,
+# ~1.8s). See the benchmark notes in the repo.
+_KOKORO_EXECUTOR = None
+_KOKORO_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_kokoro_executor():
+    global _KOKORO_EXECUTOR
+    if _KOKORO_EXECUTOR is None:
+        with _KOKORO_EXECUTOR_LOCK:
+            if _KOKORO_EXECUTOR is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kokoro")
+                # Warm the pipeline *inside* the worker thread so OpenMP's pool
+                # is initialised there (this is the whole point of the fix).
+                try:
+                    ex.submit(_tts_kokoro_sync, "ok", TTS_KOKORO_VOICE).result(timeout=120)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Kokoro executor warm-up failed: %s", e)
+                _KOKORO_EXECUTOR = ex
+    return _KOKORO_EXECUTOR
+
+
+async def _tts_kokoro(text: str, voice_id: str) -> bytes:
+    """Run Kokoro on the dedicated executor (keeps OpenMP parallelism intact)."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_get_kokoro_executor(), _tts_kokoro_sync, text, voice_id)
+
 
 def _get_kokoro():
     global _KPIPE
@@ -723,7 +759,7 @@ async def tts_to_mp3_bytes(text: str, voice: str | None = None) -> bytes:
     id). Falls back to the other engine, then to the configured default voice."""
     engine, voice_id = resolve_voice(voice)
     if engine == "kokoro":
-        data = await asyncio.to_thread(_tts_kokoro_sync, text, voice_id)
+        data = await _tts_kokoro(text, voice_id)
         if data:
             return data
         log.info("Kokoro returned no audio; falling back to edge-tts")
@@ -733,7 +769,7 @@ async def tts_to_mp3_bytes(text: str, voice: str | None = None) -> bytes:
         return data
     # Last resort: default Kokoro voice.
     log.info("edge-tts returned no audio; falling back to Kokoro default")
-    return await asyncio.to_thread(_tts_kokoro_sync, text, TTS_KOKORO_VOICE)
+    return await _tts_kokoro(text, TTS_KOKORO_VOICE)
 
 
 async def tts_to_mp3_base64(text: str, voice: str | None = None) -> str:
@@ -1158,16 +1194,18 @@ async def ask_stream(request: Request):
     turn_id = uuid.uuid4().hex[:12]
     client_id = (request.headers.get("x-client-id") or "").strip() or None
 
+    # Wall-clock anchor captured the instant the request reaches us — BEFORE the
+    # (blocking) STT parse. This is what lets us measure the real network leg
+    # against the client's request_sent_ms. Capturing it inside gen() would
+    # wrongly include the STT time in the "network" figure.
+    t_start_epoch_ms = int(time.time() * 1000)
+
     body = await _parse_input(request)
     text, stt_ms, voice, llm, meta = body
     engine, voice_id = resolve_voice(voice)
 
     async def gen():
         t_start = time.perf_counter()
-        # Wall-clock anchor so the client's end-of-speech timestamp can be
-        # stitched to the server timeline (network + queueing = request_received
-        # minus the client's request_sent).
-        t_start_epoch_ms = int(time.time() * 1000)
         try:
             if not text:
                 # Nothing intelligible captured — emit a short spoken apology
