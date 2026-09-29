@@ -16,7 +16,6 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -45,7 +44,6 @@ class MainActivity : Activity() {
     private lateinit var followUpSpinner: Spinner
     private lateinit var wakeWord: EditText
     private lateinit var llmModel: EditText
-    private lateinit var modelSpinner: Spinner
     private lateinit var status: TextView
     private lateinit var toggleButton: Button
 
@@ -108,24 +106,9 @@ class MainActivity : Activity() {
         }
         root.addView(followUpSpinner)
 
-        modelSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                Prefs.LLM_SUGGESTIONS
-            )
-            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                    llmModel.setText(Prefs.LLM_SUGGESTIONS[pos])
-                }
-                override fun onNothingSelected(p: AdapterView<*>?) {}
-            }
-        }
-
         llmModel = field("Modelo LLM", Prefs.DEFAULT_LLM_MODEL, InputType.TYPE_CLASS_TEXT)
-        root.addView(label("Modelo LLM (sugestões abaixo; pode digitar outro)"))
+        root.addView(label("Modelo LLM"))
         root.addView(llmModel)
-        root.addView(modelSpinner)
 
         root.addView(space(8))
 
