@@ -51,6 +51,11 @@ OPENROUTER_URL = os.environ.get(
     "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
 MODEL = os.environ.get("MODEL", "deepseek/deepseek-v4.1-flash")
+# Reasoning effort sent to OpenRouter. Voice replies must be snappy, so by
+# default we turn chain-of-thought OFF entirely (measured: "off" -> 0 reasoning
+# tokens, first token ~0.6-1.3s; "low" was no faster and sometimes slower).
+# Overridable via env: low | medium | high | off.
+REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "off")
 TTS_VOICE = os.environ.get("TTS_VOICE", "pt-BR-AntonioNeural")
 # TTS engine: "kokoro" (self-hosted, cheap+fast) or "edge" (edge-tts, free fallback).
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "kokoro")
@@ -265,6 +270,16 @@ def _provider_route() -> dict:
     return {"sort": "throughput", "allow_fallbacks": True}
 
 
+def _reasoning() -> dict | None:
+    # Ask the model to keep chain-of-thought short (or off) so the first spoken
+    # token arrives fast. OpenRouter accepts {"effort": low|medium|high} or
+    # {"enabled": false}. "off"/"none"/"" disables reasoning entirely.
+    effort = (REASONING_EFFORT or "").strip().lower()
+    if effort in ("", "off", "none", "false", "0"):
+        return {"enabled": False}
+    return {"effort": effort}
+
+
 def _remember(user_text: str, answer: str) -> None:
     HISTORY.append({"role": "user", "content": user_text})
     HISTORY.append({"role": "assistant", "content": answer})
@@ -286,6 +301,7 @@ async def run_agent(user_text: str, model: str | None = None) -> str:
                 "messages": messages,
                 "tools": TOOLS,
                 "provider": _provider_route(),
+                "reasoning": _reasoning(),
             }
             r = await client.post(OPENROUTER_URL, headers=_headers(), json=payload)
             r.raise_for_status()
@@ -333,6 +349,7 @@ async def stream_agent(user_text: str, model: str | None = None):
                 "messages": messages,
                 "tools": TOOLS,
                 "provider": _provider_route(),
+                "reasoning": _reasoning(),
                 "stream": True,
             }
             content_parts: list[str] = []
