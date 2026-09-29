@@ -65,6 +65,7 @@ def embed(path_in_image: str, data: bytes) -> str:
 
 def build_dockerfile() -> str:
     app = open(os.path.join(HERE, "app.py"), "rb").read()
+    telemetry = open(os.path.join(HERE, "telemetry.py"), "rb").read()
     parts = [
         "FROM python:3.12-slim",
         "ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1",
@@ -82,6 +83,7 @@ def build_dockerfile() -> str:
         "WORKDIR /app",
         "RUN mkdir -p /workspace",
         embed("/app/app.py", app),
+        embed("/app/telemetry.py", telemetry),
     ]
     # NOTE: SOUL.md / USER.md / TOOLS.md are NOT baked in anymore — the real
     # nanobot workspace is bind-mounted at /workspace (EasyPanel mount), so the

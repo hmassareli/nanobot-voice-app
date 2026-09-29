@@ -33,6 +33,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from pathlib import Path
 
@@ -41,6 +42,8 @@ import re
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+import telemetry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice-api")
@@ -286,8 +289,16 @@ def _remember(user_text: str, answer: str) -> None:
     del HISTORY[:-MAX_HISTORY]
 
 
-async def run_agent(user_text: str, model: str | None = None) -> str:
-    """Non-streaming agent (kept for /ask and as a fallback)."""
+async def run_agent(user_text: str, model: str | None = None,
+                    stats: dict | None = None) -> str:
+    """Non-streaming agent (kept for /ask and as a fallback).
+
+    If `stats` is given it is filled in-place with telemetry (token usage, tool
+    names) exactly like `stream_agent`."""
+    if stats is None:
+        stats = {}
+    stats.setdefault("tool_calls", [])
+    stats.setdefault("tool_rounds", 0)
     if not OPENROUTER_API_KEY:
         return "Serviço sem chave de LLM configurada."
     messages = [{"role": "system", "content": build_system_prompt()}]
@@ -305,7 +316,24 @@ async def run_agent(user_text: str, model: str | None = None) -> str:
             }
             r = await client.post(OPENROUTER_URL, headers=_headers(), json=payload)
             r.raise_for_status()
-            msg = r.json()["choices"][0]["message"]
+            body = r.json()
+            usage = body.get("usage")
+            if isinstance(usage, dict):
+                # Accumulate across tool rounds (each round bills separately).
+                prev = stats.get("usage") or {}
+                merged = dict(prev)
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens",
+                          "reasoning_tokens"):
+                    if usage.get(k) is not None:
+                        merged[k] = (prev.get(k) or 0) + usage[k]
+                if usage.get("cost") is not None:
+                    merged["cost"] = (prev.get("cost") or 0.0) + usage["cost"]
+                if isinstance(usage.get("completion_tokens_details"), dict):
+                    merged["completion_tokens_details"] = usage["completion_tokens_details"]
+                if isinstance(usage.get("cost_details"), dict):
+                    merged["cost_details"] = usage["cost_details"]
+                stats["usage"] = merged
+            msg = body["choices"][0]["message"]
             tool_calls = msg.get("tool_calls")
             if not tool_calls:
                 answer = (msg.get("content") or "").strip()
@@ -314,6 +342,8 @@ async def run_agent(user_text: str, model: str | None = None) -> str:
             messages.append(msg)
             for tc in tool_calls:
                 fn = tc["function"]["name"]
+                stats["tool_calls"].append(fn)
+                stats["tool_rounds"] = stats.get("tool_rounds", 0) + 1
                 try:
                     targs = json.loads(tc["function"].get("arguments") or "{}")
                 except json.JSONDecodeError:
@@ -327,14 +357,23 @@ async def run_agent(user_text: str, model: str | None = None) -> str:
         return "Desculpe, não consegui concluir a solicitação."
 
 
-async def stream_agent(user_text: str, model: str | None = None):
+async def stream_agent(user_text: str, model: str | None = None,
+                       stats: dict | None = None):
     """Streaming agent: yields content deltas as they arrive from OpenRouter.
 
     Tool-calling is supported across rounds: if the model emits tool_calls in a
     round, the accumulated calls are executed and the loop continues (the next
     round's content is streamed). In the common no-tool case the very first
     tokens are yielded immediately, so TTS can start before the answer is done.
+
+    If `stats` is provided it is filled in-place with telemetry for the turn:
+    token usage (prompt/completion/total/cost/reasoning), the list of tool names
+    invoked and how many tool rounds were needed.
     """
+    if stats is None:
+        stats = {}
+    stats.setdefault("tool_calls", [])
+    stats.setdefault("tool_rounds", 0)
     if not OPENROUTER_API_KEY:
         yield "Serviço sem chave de LLM configurada."
         return
@@ -351,6 +390,9 @@ async def stream_agent(user_text: str, model: str | None = None):
                 "provider": _provider_route(),
                 "reasoning": _reasoning(),
                 "stream": True,
+                # Ask OpenRouter to append a final chunk carrying token usage +
+                # cost, so we can log exactly what each turn spent.
+                "stream_options": {"include_usage": True},
             }
             content_parts: list[str] = []
             tool_calls: dict[int, dict] = {}
@@ -368,6 +410,10 @@ async def stream_agent(user_text: str, model: str | None = None):
                         obj = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    # Usage typically arrives on the final chunk (empty choices).
+                    usage = obj.get("usage")
+                    if isinstance(usage, dict):
+                        stats["usage"] = usage
                     choices = obj.get("choices") or []
                     if not choices:
                         continue
@@ -394,6 +440,10 @@ async def stream_agent(user_text: str, model: str | None = None):
                             slot["arguments"] += fn["arguments"]
 
             if tool_calls:
+                stats["tool_rounds"] = stats.get("tool_rounds", 0) + 1
+                for s in tool_calls.values():
+                    if s.get("name"):
+                        stats["tool_calls"].append(s["name"])
                 # Model wants tools: run them, then continue streaming next round.
                 messages.append({
                     "role": "assistant",
@@ -452,15 +502,22 @@ def _get_whisper_model():
     return _WHISPER_MODEL
 
 
-async def transcribe_audio(path: str) -> str:
+async def transcribe_audio(path: str, detail: dict | None = None) -> str:
     """Groq Whisper (if GROQ_API_KEY) -> faster-whisper local (singleton).
 
     Phone mics (especially MIUI) often capture very quiet audio. We peak-normalise
     the WAV first so a faint recording is not silently discarded by Whisper's
     internal silence detection.
+
+    If `detail` is given it is filled in-place with telemetry about the STT step:
+    which model/engine produced the transcript and whether a fallback was used.
     """
+    if detail is None:
+        detail = {}
+    detail.setdefault("fallback_used", False)
     norm_path = _normalize_wav(path)
     if GROQ_API_KEY:
+        detail["model"] = "groq/whisper-large-v3-turbo"
         try:
             async with httpx.AsyncClient() as client:
                 with open(norm_path, "rb") as f:
@@ -476,7 +533,9 @@ async def transcribe_audio(path: str) -> str:
                     return text.strip()
         except Exception as e:  # noqa: BLE001
             log.warning("Groq transcription failed: %s", e)
+        detail["fallback_used"] = True
 
+    detail["model"] = f"faster-whisper/{WHISPER_MODEL}"
     try:
         def _whisper() -> str:
             model = _get_whisper_model()
@@ -494,7 +553,68 @@ async def transcribe_audio(path: str) -> str:
         return await asyncio.to_thread(_whisper)
     except Exception as e:  # noqa: BLE001
         log.warning("Local whisper transcription failed: %s", e)
+        detail["model"] = detail.get("model") or "faster-whisper"
         return ""
+
+
+def _audio_stats_from_file(path: str, size_bytes: int | None = None) -> dict:
+    """Acoustic stats for a 16-bit PCM WAV: duration, RMS, peak and dBFS.
+
+    Used to record `audio_in` per turn so a bad/quiet recording is auditable
+    after the fact. Best-effort: returns what it can on partial failures.
+    """
+    out: dict = {"bytes": size_bytes, "duration_s": None, "rms": None,
+                 "peak": None, "dbfs": None}
+    try:
+        if size_bytes is None:
+            out["bytes"] = os.path.getsize(path)
+        import numpy as np
+
+        with wave.open(path, "rb") as w:
+            sr, ch, sw, n = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
+            data = w.readframes(n)
+        if sw != 2 or n == 0:
+            return out
+        x = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+        if x.size == 0:
+            return out
+        peak = float(np.max(np.abs(x)))
+        rms = float(np.sqrt(np.mean(np.square(x))))
+        out["duration_s"] = round(n / float(sr), 3) if sr else None
+        out["peak"] = round(peak, 1)
+        out["rms"] = round(rms, 2)
+        if rms > 0:
+            import math
+            out["dbfs"] = round(20.0 * math.log10(rms / 32768.0), 2)
+        out["sample_rate"] = sr
+        out["channels"] = ch
+    except Exception as e:  # noqa: BLE001
+        log.warning("audio stats failed for %s: %s", path, e)
+    return out
+
+
+def _usage_block(stats: dict) -> dict:
+    """Normalise the OpenRouter usage dict into the telemetry `llm` fields."""
+    usage = stats.get("usage") if isinstance(stats, dict) else None
+    block = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "cost_usd": None,
+        "reasoning_tokens": None,
+    }
+    if isinstance(usage, dict):
+        block["prompt_tokens"] = usage.get("prompt_tokens")
+        block["completion_tokens"] = usage.get("completion_tokens")
+        block["total_tokens"] = usage.get("total_tokens")
+        # OpenRouter returns the spend either in the top-level usage or nested.
+        cost = usage.get("cost")
+        if cost is None and isinstance(usage.get("cost_details"), dict):
+            cost = usage["cost_details"].get("upstream_inference_cost")
+        block["cost_usd"] = cost
+        details = usage.get("completion_tokens_details") or {}
+        block["reasoning_tokens"] = details.get("reasoning_tokens")
+    return block
 
 
 def _normalize_wav(path: str) -> str:
@@ -741,14 +861,20 @@ def _authed(request: Request) -> bool:
     return auth == f"Bearer {VOICE_TOKEN}"
 
 
-async def _parse_input(request: Request) -> tuple[str, float, str | None, str | None]:
+async def _parse_input(request: Request) -> tuple[str, float, str | None, str | None, dict]:
     """Extract the user text from either JSON {"text": ...} or multipart audio.
-    Returns (text, stt_ms, voice, llm)."""
+    Returns (text, stt_ms, voice, llm, meta).
+
+    `meta` carries telemetry for the input side:
+      meta["audio_in"] -> {bytes, duration_s, rms, peak, dbfs, ...} or None
+      meta["stt"]      -> {model, fallback_used}
+    """
     ctype = request.headers.get("content-type", "")
     text = ""
     stt_ms = 0.0
     voice: str | None = None
     llm: str | None = None
+    meta: dict = {"audio_in": None, "stt": {"model": None, "fallback_used": False}}
     if ctype.startswith("application/json"):
         try:
             body = await request.json()
@@ -757,6 +883,7 @@ async def _parse_input(request: Request) -> tuple[str, float, str | None, str | 
         text = (body.get("text") or "").strip()
         voice = (body.get("voice") or "").strip() or None
         llm = (body.get("llm") or body.get("model") or "").strip() or None
+        meta["stt"]["model"] = "text-input"
     else:
         form = await request.form()
         voice = (form.get("voice") or "").strip() or None
@@ -768,15 +895,16 @@ async def _parse_input(request: Request) -> tuple[str, float, str | None, str | 
             with open(tmp, "wb") as f:
                 f.write(await up.read())
             try:
+                meta["audio_in"] = _audio_stats_from_file(tmp)
                 t_stt = time.perf_counter()
-                text = (await transcribe_audio(tmp)).strip()
+                text = (await transcribe_audio(tmp, meta["stt"])).strip()
                 stt_ms = (time.perf_counter() - t_stt) * 1000
             finally:
                 try:
                     os.remove(tmp)
                 except OSError:
                     pass
-    return text, stt_ms, voice, llm
+    return text, stt_ms, voice, llm, meta
 
 
 @app.post("/ask")
@@ -785,23 +913,56 @@ async def ask(request: Request):
     if not _authed(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    text, stt_ms, voice, llm = await _parse_input(request)
+    turn_id = uuid.uuid4().hex[:12]
+    client_id = (request.headers.get("x-client-id") or "").strip() or None
+
+    body = await _parse_input(request)
+    text, stt_ms, voice, llm, meta = body
+    engine, voice_id = resolve_voice(voice)
+
+    def _record(answer_text: str, llm_block: dict | None = None,
+                tts_block: dict | None = None, first_audio_ms=None,
+                stt_failed: bool = False) -> None:
+        telemetry.record_turn_safe({
+            "turn_id": turn_id,
+            "endpoint": "/ask",
+            "client_id": client_id,
+            "model_llm": llm or MODEL,
+            "tts_engine": engine,
+            "tts_voice": voice_id,
+            "stt_failed": stt_failed,
+            "audio_in": meta.get("audio_in"),
+            "stt": {**(meta.get("stt") or {}), "text": text, "ok": bool(text),
+                    "ms": round(stt_ms, 1)},
+            "llm": llm_block,
+            "tts": tts_block,
+            "answer": answer_text,
+            "timings": {
+                "first_audio_ms": round(first_audio_ms, 1) if first_audio_ms else None,
+                "total_ms": round((time.perf_counter() - t_start) * 1000, 1),
+            },
+        })
+
     if not text:
         # Nothing intelligible was captured. Answer directly instead of feeding a
         # placeholder into the LLM (which used to produce "manda por texto").
         msg = "Não consegui te ouvir direito. Pode repetir, por favor?"
         audio_b64 = await tts_to_mp3_base64(msg, voice) if voice else ""
+        _record(msg, tts_block={"tts_total_ms": None, "sentences": [
+            {"index": 0, "text": msg, "ms": None}]}, stt_failed=True)
         return {
             "text": msg,
             "audio_base64": audio_b64,
             "timings": {"stt_ms": round(stt_ms, 1)},
             "stt_failed": True,
+            "turn_id": turn_id,
         }
 
-    log.info("ask text=%r voice=%r llm=%r", text[:200], voice, llm)
+    log.info("ask turn=%s text=%r voice=%r llm=%r", turn_id, text[:200], voice, llm)
 
     t_llm = time.perf_counter()
-    answer = await run_agent(text, llm)
+    llm_stats: dict = {}
+    answer = await run_agent(text, llm, llm_stats)
     llm_ms = (time.perf_counter() - t_llm) * 1000
 
     t_tts = time.perf_counter()
@@ -809,17 +970,37 @@ async def ask(request: Request):
     tts_ms = (time.perf_counter() - t_tts) * 1000
 
     total_ms = (time.perf_counter() - t_start) * 1000
-    timings = {
+    timing = {
         "stt_ms": round(stt_ms, 1),
         "llm_ms": round(llm_ms, 1),
         "tts_ms": round(tts_ms, 1),
         "total_ms": round(total_ms, 1),
     }
     log.info(
-        "TIMING stt=%.0fms llm=%.0fms tts=%.0fms total=%.0fms",
-        stt_ms, llm_ms, tts_ms, total_ms,
+        "TIMING turn=%s stt=%.0fms llm=%.0fms tts=%.0fms total=%.0fms",
+        turn_id, stt_ms, llm_ms, tts_ms, total_ms,
     )
-    return {"text": answer, "audio_base64": audio_b64, "timings": timings}
+
+    sents = split_sentences(answer) if answer else []
+    tts_block = {
+        "tts_total_ms": round(tts_ms, 1),
+        "sentences": [
+            {"index": i, "text": s, "ms": None,
+             "audio_bytes": None, "fmt": "mp3"}
+            for i, s in enumerate(sents)
+        ],
+    }
+    llm_block = {
+        **_usage_block(llm_stats),
+        "first_token_ms": None,  # not applicable: /ask is non-streaming
+        "total_ms": round(llm_ms, 1),
+        "tool_calls": llm_stats.get("tool_calls") or [],
+        "tool_rounds": llm_stats.get("tool_rounds", 0),
+    }
+    _record(answer, llm_block=llm_block, tts_block=tts_block)
+
+    return {"text": answer, "audio_base64": audio_b64, "timings": timing,
+            "turn_id": turn_id}
 
 
 @app.post("/ask_stream")
@@ -830,7 +1011,7 @@ async def ask_stream(request: Request):
     (application/x-ndjson), one JSON object per line:
       {"type":"text","text":"<full answer>"}
       {"type":"audio","data":"<base64 mp3 of one sentence>","index":i,"text":"..."}
-      {"type":"done","timings":{...}}
+      {"type":"done","timings":{...},"turn_id":"..."}
       {"type":"error","message":"..."}
 
     The LLM is streamed (SSE). A producer task feeds streamed tokens into a
@@ -848,7 +1029,12 @@ async def ask_stream(request: Request):
     # `await request.json()` / `request.form()` blocks forever (the client sees
     # a 200 with zero bytes and eventually times out). /ask worked only because
     # it parses the body before responding.
-    text, stt_ms, voice, llm = await _parse_input(request)
+    turn_id = uuid.uuid4().hex[:12]
+    client_id = (request.headers.get("x-client-id") or "").strip() or None
+
+    body = await _parse_input(request)
+    text, stt_ms, voice, llm, meta = body
+    engine, voice_id = resolve_voice(voice)
 
     async def gen():
         t_start = time.perf_counter()
@@ -857,8 +1043,10 @@ async def ask_stream(request: Request):
                 # Nothing intelligible captured — emit a short spoken apology
                 # instead of pushing a placeholder through the LLM.
                 msg = "Não consegui te ouvir direito. Pode repetir, por favor?"
-                audio = await tts_to_mp3_base64(msg, voice) if voice else b""
+                audio = await tts_to_mp3_bytes(msg, voice) if voice else b""
+                first_audio_ms = None
                 if audio:
+                    first_audio_ms = (time.perf_counter() - t_start) * 1000
                     yield json.dumps({
                         "type": "audio",
                         "data": base64.b64encode(audio).decode(),
@@ -866,13 +1054,26 @@ async def ask_stream(request: Request):
                         "text": msg,
                     }) + "\n"
                 yield json.dumps({"type": "text", "text": msg}) + "\n"
+                telemetry.record_turn_safe({
+                    "turn_id": turn_id, "endpoint": "/ask_stream",
+                    "client_id": client_id, "model_llm": llm or MODEL,
+                    "tts_engine": engine, "tts_voice": voice_id,
+                    "stt_failed": True, "audio_in": meta.get("audio_in"),
+                    "stt": {**(meta.get("stt") or {}), "text": text,
+                            "ok": False, "ms": round(stt_ms, 1)},
+                    "llm": None, "tts": None, "answer": msg,
+                    "timings": {"first_audio_ms": first_audio_ms,
+                                "total_ms": round((time.perf_counter() - t_start) * 1000, 1)},
+                })
                 yield json.dumps({
                     "type": "done",
                     "timings": {"stt_ms": round(stt_ms, 1)},
                     "stt_failed": True,
+                    "turn_id": turn_id,
                 }) + "\n"
                 return
-            log.info("ask_stream text=%r voice=%r llm=%r", text[:200], voice, llm)
+            log.info("ask_stream turn=%s text=%r voice=%r llm=%r",
+                     turn_id, text[:200], voice, llm)
 
             t_llm = time.perf_counter()
             first_token_ms = None
@@ -880,6 +1081,8 @@ async def ask_stream(request: Request):
             tts_ms = 0.0
             index = 0
             full_answer: list[str] = []
+            llm_stats: dict = {}
+            tts_sentences: list[dict] = []
 
             # Queue carries ("sent", sentence) or ("end", None).
             queue: asyncio.Queue = asyncio.Queue()
@@ -888,7 +1091,7 @@ async def ask_stream(request: Request):
                 nonlocal first_token_ms
                 buf = SentenceBuffer()
                 try:
-                    async for piece in stream_agent(text, llm):
+                    async for piece in stream_agent(text, llm, llm_stats):
                         if first_token_ms is None:
                             first_token_ms = (time.perf_counter() - t_llm) * 1000
                         full_answer.append(piece)
@@ -914,7 +1117,12 @@ async def ask_stream(request: Request):
                 sentence = payload
                 t_tts = time.perf_counter()
                 data = await tts_to_mp3_bytes(sentence, voice)
-                tts_ms += (time.perf_counter() - t_tts) * 1000
+                sent_ms = (time.perf_counter() - t_tts) * 1000
+                tts_ms += sent_ms
+                tts_sentences.append({
+                    "index": index, "text": sentence, "ms": round(sent_ms, 1),
+                    "audio_bytes": len(data) if data else 0, "fmt": "mp3",
+                })
                 if not data:
                     continue
                 if first_audio_ms is None:
@@ -944,12 +1152,38 @@ async def ask_stream(request: Request):
                 "sentences": index,
             }
             log.info(
-                "TIMING(stream) stt=%.0fms llm=%.0fms tts=%.0fms total=%.0fms "
+                "TIMING(stream) turn=%s stt=%.0fms llm=%.0fms tts=%.0fms total=%.0fms "
                 "first_token=%.0fms first_audio=%.0fms sentences=%d",
-                stt_ms, llm_ms, tts_ms, total_ms,
+                turn_id, stt_ms, llm_ms, tts_ms, total_ms,
                 first_token_ms or -1, first_audio_ms or -1, index,
             )
-            yield json.dumps({"type": "done", "timings": timings}) + "\n"
+            telemetry.record_turn_safe({
+                "turn_id": turn_id,
+                "endpoint": "/ask_stream",
+                "client_id": client_id,
+                "model_llm": llm or MODEL,
+                "tts_engine": engine,
+                "tts_voice": voice_id,
+                "stt_failed": False,
+                "audio_in": meta.get("audio_in"),
+                "stt": {**(meta.get("stt") or {}), "text": text, "ok": True,
+                        "ms": round(stt_ms, 1)},
+                "llm": {
+                    **_usage_block(llm_stats),
+                    "first_token_ms": round(first_token_ms, 1) if first_token_ms else None,
+                    "total_ms": round(llm_ms, 1),
+                    "tool_calls": llm_stats.get("tool_calls") or [],
+                    "tool_rounds": llm_stats.get("tool_rounds", 0),
+                },
+                "tts": {
+                    "tts_total_ms": round(tts_ms, 1),
+                    "sentences": tts_sentences,
+                },
+                "answer": answer,
+                "timings": timings,
+            })
+            yield json.dumps({"type": "done", "timings": timings,
+                              "turn_id": turn_id}) + "\n"
         except Exception as e:  # noqa: BLE001
             log.exception("ask_stream failed")
             yield json.dumps({"type": "error", "message": str(e)}) + "\n"
@@ -959,3 +1193,51 @@ async def ask_stream(request: Request):
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --- telemetry endpoints ---------------------------------------------------
+@app.get("/logs")
+async def logs(request: Request, limit: int = 20, since: str | None = None,
+               turn_id: str | None = None):
+    """Recent turns (with their Android-side metrics merged) + an aggregate
+    summary. Auth: Bearer token, same as /ask."""
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    turns = telemetry.load_turns(limit=limit, since=since, turn_id=turn_id)
+    return {
+        "summary": telemetry.summarize(turns),
+        "phrases": telemetry.phrases(turns),
+        "turns": turns,
+    }
+
+
+@app.get("/logs/summary")
+async def logs_summary(request: Request, limit: int = 100,
+                       since: str | None = None):
+    """Only the aggregate metrics (avg/p50/p95/min/max) over the last N turns."""
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    turns = telemetry.load_turns(limit=limit, since=since)
+    return {"summary": telemetry.summarize(turns),
+            "phrases": telemetry.phrases(turns)}
+
+
+@app.post("/report")
+async def report(request: Request):
+    """Client-side telemetry from the Android app (best-effort, fire-and-forget).
+
+    Body: JSON with a `turn_id` (optional) plus any client metrics
+    (record_ms, upload_ms, request_to_first_audio_ms, total_play_ms, chunks,
+    device_model, android_sdk, app_version, network, wake_detect_ms...).
+    """
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    turn_id = (body.pop("turn_id", None) or "").strip() or None
+    telemetry.record_client_report_safe(turn_id, body)
+    return {"status": "ok"}
