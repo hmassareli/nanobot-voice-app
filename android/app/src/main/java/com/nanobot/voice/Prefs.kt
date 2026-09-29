@@ -1,6 +1,8 @@
 package com.nanobot.voice
 
 import android.content.Context
+import android.provider.Settings
+import java.util.UUID
 
 /**
  * Central definition of the persisted configuration plus the pick-lists used by
@@ -16,6 +18,9 @@ object Prefs {
     const val KEY_LLM_MODEL = "llm_model"
     const val KEY_ENABLED = "service_enabled"
     const val KEY_FOLLOW_UP = "follow_up_seconds"
+
+    /** Persisted stable id sent to the backend as the `X-Client-Id` header. */
+    const val KEY_CLIENT_ID = "client_id"
 
     // Matches README.md ("Confira a URL do servidor e o token (já vêm
     // preenchidos)"), so a fresh install works without manual setup.
@@ -88,4 +93,29 @@ object Prefs {
     fun followUpSeconds(ctx: Context): Int = get(ctx)
         .getInt(KEY_FOLLOW_UP, DEFAULT_FOLLOW_UP_SECONDS)
         .coerceAtLeast(0)
+
+    /**
+     * Stable, device-unique client id used for telemetry (the backend groups
+     * turns by it). We persist a random UUID on first use so it survives
+     * reboots/reinstalls only if the prefs file survives; if the prefs are
+     * missing (fresh install, cleared data) we fall back to the Android
+     * `ANDROID_ID`, which is stable per app signature + user. Never throws.
+     */
+    fun clientId(ctx: Context): String {
+        try {
+            val prefs = get(ctx)
+            prefs.getString(KEY_CLIENT_ID, null)?.takeIf { it.isNotBlank() }?.let { return it }
+            val id = try {
+                Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID)
+                    ?.takeIf { it.isNotBlank() }
+            } catch (_: Throwable) {
+                null
+            } ?: UUID.randomUUID().toString()
+            prefs.edit().putString(KEY_CLIENT_ID, id).apply()
+            return id
+        } catch (_: Throwable) {
+            // Absolutely last resort: a per-process random id.
+            return UUID.randomUUID().toString()
+        }
+    }
 }

@@ -12,7 +12,28 @@ import java.util.concurrent.TimeUnit
 
 data class AskResult(
     val text: String,
-    val audio: ByteArray
+    val audio: ByteArray,
+    val turnId: String? = null
+)
+
+/**
+ * Client-side measurements collected while streaming a reply. These complement
+ * the server-side timings (which only know the backend's own clock) with what
+ * the phone actually experienced: how long until the *first* audio chunk landed
+ * and how much audio we received in total.
+ *
+ * @param turnId          server-assigned turn id (from the "done" event), if any.
+ * @param firstAudioMs    ms from sending the request to the FIRST audio chunk.
+ * @param chunks          number of audio chunks received.
+ * @param audioBytes      total bytes of (encoded) audio received.
+ * @param requestStartedMs wall-clock (SystemClock/currentTimeMillis) when the request was sent.
+ */
+data class StreamMetrics(
+    val turnId: String? = null,
+    val firstAudioMs: Long? = null,
+    val chunks: Int = 0,
+    val audioBytes: Long = 0,
+    val requestStartedMs: Long = 0
 )
 
 /**
@@ -20,22 +41,26 @@ data class AskResult(
  *
  * POST {serverUrl}/ask  (multipart/form-data)
  *   header: Authorization: Bearer <token>
+ *   header: X-Client-Id: <stable device id>
  *   field "audio": WAV file (16 kHz mono PCM)
  *   field "voice": TTS voice id
  *   optional field "llm": model id
- * Response JSON: {"text": "...", "audio_base64": "..."}  (base64 of an audio file)
+ * Response JSON: {"text": "...", "audio_base64": "...", "turn_id": "..."}  (base64 of an audio file)
  *
  * POST {serverUrl}/ask_stream  (multipart/form-data, same fields)
  * Response: NDJSON (application/x-ndjson), one JSON object per line:
  *   {"type":"text","text":"<full answer>"}
  *   {"type":"audio","data":"<base64 ogg/opus of one sentence>","index":i,"text":"..."}
- *   {"type":"done","timings":{...}}
+ *   {"type":"done","timings":{...},"turn_id":"..."}
  *   {"type":"error","message":"..."}
+ *
+ * POST {serverUrl}/report  (application/json) — fire-and-forget client telemetry.
  */
 class NanobotClient(
     serverUrl: String,
     private val token: String,
-    private val timeoutSeconds: Long = 120
+    private val timeoutSeconds: Long = 120,
+    private val clientId: String? = null
 ) {
     private val baseUrl: String = serverUrl.trimEnd('/')
 
@@ -53,6 +78,9 @@ class NanobotClient(
         if (token.isNotBlank()) {
             reqBuilder.header("Authorization", "Bearer $token")
         }
+        if (!clientId.isNullOrBlank()) {
+            reqBuilder.header("X-Client-Id", clientId)
+        }
 
         http.newCall(reqBuilder.build()).execute().use { resp ->
             val bodyStr = resp.body?.string().orEmpty()
@@ -64,6 +92,7 @@ class NanobotClient(
             }
             val json = JSONObject(bodyStr)
             val text = json.optString("text", "")
+            val turnId = json.optString("turn_id", "").takeIf { it.isNotBlank() }
             val b64 = json.optString("audio_base64", "")
             val audio = if (b64.isNotBlank()) {
                 try {
@@ -75,7 +104,7 @@ class NanobotClient(
             } else {
                 ByteArray(0)
             }
-            return AskResult(text, audio)
+            return AskResult(text, audio, turnId)
         }
     }
 
@@ -84,6 +113,12 @@ class NanobotClient(
      * the NDJSON response line by line, invoking [onText] for the text event and
      * [onAudioChunk] for *each* audio chunk as soon as it arrives. This lets the
      * caller start playback before the whole answer is synthesized.
+     *
+     * Client-side telemetry is collected on the way:
+     *   * [onTurnId] is invoked with the server `turn_id` as soon as the "done"
+     *     event arrives (also returned in [StreamMetrics.turnId]);
+     *   * [StreamMetrics.firstAudioMs] measures the request→first-chunk latency;
+     *   * [StreamMetrics.chunks] / [StreamMetrics.audioBytes] count what arrived.
      *
      * If the server does not implement the streaming endpoint (HTTP 404), it
      * transparently falls back to the non-streaming [ask].
@@ -94,13 +129,30 @@ class NanobotClient(
         voice: String,
         llmModel: String?,
         onText: (String) -> Unit,
-        onAudioChunk: (ByteArray) -> Unit
-    ) {
+        onAudioChunk: (ByteArray) -> Unit,
+        onTurnId: ((String) -> Unit)? = null
+    ): StreamMetrics {
+        val t0 = System.currentTimeMillis()
+        var firstAudioMs: Long? = null
+        var chunks = 0
+        var audioBytes = 0L
+        var turnId: String? = null
+
+        fun noteChunk(bytes: ByteArray) {
+            if (firstAudioMs == null) firstAudioMs = System.currentTimeMillis() - t0
+            chunks++
+            audioBytes += bytes.size.toLong()
+            onAudioChunk(bytes)
+        }
+
         val reqBuilder = Request.Builder()
             .url("$baseUrl/ask_stream")
             .post(buildMultipart(wavBytes, voice, llmModel))
         if (token.isNotBlank()) {
             reqBuilder.header("Authorization", "Bearer $token")
+        }
+        if (!clientId.isNullOrBlank()) {
+            reqBuilder.header("X-Client-Id", clientId)
         }
 
         http.newCall(reqBuilder.build()).execute().use { resp ->
@@ -109,8 +161,9 @@ class NanobotClient(
                 Log.w("NanobotClient", "/ask_stream ausente (404) — usando /ask")
                 val result = ask(wavBytes, voice, llmModel)
                 if (result.text.isNotBlank()) onText(result.text)
-                if (result.audio.isNotEmpty()) onAudioChunk(result.audio)
-                return
+                if (result.audio.isNotEmpty()) noteChunk(result.audio)
+                result.turnId?.let { onTurnId?.invoke(it) }
+                return StreamMetrics(result.turnId, firstAudioMs, chunks, audioBytes, t0)
             }
             if (!resp.isSuccessful) {
                 val bodyStr = resp.body?.string().orEmpty()
@@ -141,10 +194,17 @@ class NanobotClient(
                                 Log.e("NanobotClient", "chunk de áudio inválido", t)
                                 ByteArray(0)
                             }
-                            if (bytes.isNotEmpty()) onAudioChunk(bytes)
+                            if (bytes.isNotEmpty()) noteChunk(bytes)
                         }
                     }
-                    "done" -> return
+                    "done" -> {
+                        val id = evt.optString("turn_id", "")
+                        if (id.isNotBlank()) {
+                            turnId = id
+                            onTurnId?.invoke(id)
+                        }
+                        return StreamMetrics(turnId, firstAudioMs, chunks, audioBytes, t0)
+                    }
                     "error" -> throw IOException(
                         evt.optString("message", "erro desconhecido do servidor")
                     )
@@ -152,6 +212,34 @@ class NanobotClient(
                 }
             }
         }
+        return StreamMetrics(turnId, firstAudioMs, chunks, audioBytes, t0)
+    }
+
+    /**
+     * Fire-and-forget client telemetry. Posts [payload] (a JSON object) to
+     * `$baseUrl/report` on a background thread. This method NEVER throws: any
+     * failure (offline, timeout, bad response) is swallowed and logged, because
+     * telemetry must never break the voice flow.
+     */
+    fun report(clientId: String, token: String, payload: JSONObject) {
+        Thread {
+            try {
+                val body = payload.toString().toRequestBody("application/json".toMediaType())
+                val req = Request.Builder()
+                    .url("$baseUrl/report")
+                    .post(body)
+                val bearer = token.ifBlank { this.token }
+                if (bearer.isNotBlank()) req.header("Authorization", "Bearer $bearer")
+                if (clientId.isNotBlank()) req.header("X-Client-Id", clientId)
+                http.newCall(req.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        Log.w("NanobotClient", "/report HTTP ${resp.code}")
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w("NanobotClient", "/report falhou (ignorado): ${t.message}")
+            }
+        }.apply { isDaemon = true }.start()
     }
 
     private fun buildMultipart(wavBytes: ByteArray, voice: String, llmModel: String?): MultipartBody {

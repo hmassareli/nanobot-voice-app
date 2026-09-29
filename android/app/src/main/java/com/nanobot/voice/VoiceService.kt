@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import org.json.JSONObject
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.sqrt
@@ -171,14 +172,16 @@ class VoiceService : Service() {
      * not have to repeat the wake word every single time.
      */
     private suspend fun handleRequest(ctx: Context) {
+        val rec0 = System.currentTimeMillis()
         var wav: ByteArray = recordForRequest(waitMillis = 4000, countdown = false)
             ?: run {
                 updateNotification("Não ouvi nada. Tente novamente.")
                 return
             }
+        var recordMs = System.currentTimeMillis() - rec0
 
         while (active) {
-            askAndPlay(ctx, wav)
+            askAndPlay(ctx, wav, recordMs)
             if (!active) return
 
             val followUpSeconds = Prefs.followUpSeconds(ctx)
@@ -186,8 +189,10 @@ class VoiceService : Service() {
 
             // Nothing said in the follow-up window -> the conversation is over,
             // go back to listening for the wake word.
+            val rec1 = System.currentTimeMillis()
             wav = recordForRequest(waitMillis = followUpSeconds * 1000, countdown = true)
                 ?: return
+            recordMs = System.currentTimeMillis() - rec1
         }
     }
 
@@ -220,7 +225,7 @@ class VoiceService : Service() {
     }
 
     /** Sends [wav] to the backend and streams the spoken answer. */
-    private suspend fun askAndPlay(ctx: Context, wav: ByteArray) {
+    private suspend fun askAndPlay(ctx: Context, wav: ByteArray, recordMs: Long) {
         updateNotification("Pensando…")
 
         // --- streaming playback -------------------------------------------
@@ -231,18 +236,35 @@ class VoiceService : Service() {
         val audioChunks = Channel<ByteArray>(Channel.UNLIMITED)
         var startedPlaying = false
 
+        // Client-side playback timings.
+        var firstChunkPlayMs: Long? = null
+        var totalPlayMs: Long? = null
+        val playWindowStart = System.currentTimeMillis()
+
         val playerJob = scope.launch {
             for (chunk in audioChunks) {
+                val chunkStart = System.currentTimeMillis()
                 try {
                     playAudio(chunk)
                 } catch (t: Throwable) {
                     Log.e(TAG, "Erro ao tocar áudio", t)
+                } finally {
+                    if (firstChunkPlayMs == null) {
+                        // ms from the start of the turn until playback of the
+                        // first chunk actually began (includes network + prep).
+                        firstChunkPlayMs = chunkStart - playWindowStart
+                    }
+                    totalPlayMs = System.currentTimeMillis() - playWindowStart
                 }
             }
         }
 
+        var metrics: StreamMetrics? = null
+        var turnId: String? = null
         try {
-            NanobotClient(Prefs.serverUrl(ctx), Prefs.token(ctx)).askStream(
+            metrics = NanobotClient(
+                Prefs.serverUrl(ctx), Prefs.token(ctx), clientId = Prefs.clientId(ctx)
+            ).askStream(
                 wav, Prefs.voice(ctx), Prefs.llmModel(ctx),
                 onText = { text ->
                     Log.i(TAG, "Resposta: $text")
@@ -255,7 +277,8 @@ class VoiceService : Service() {
                     }
                     // trySend on an UNLIMITED channel never blocks the reader.
                     audioChunks.trySend(bytes)
-                }
+                },
+                onTurnId = { id -> turnId = id }
             )
         } catch (t: Throwable) {
             Log.e(TAG, "Erro no backend", t)
@@ -264,6 +287,53 @@ class VoiceService : Service() {
             // Signal end-of-stream so the player worker drains and exits.
             audioChunks.close()
             playerJob.join()
+        }
+
+        // --- client-side telemetry (best-effort, never blocks the voice) ---
+        try {
+            val m = metrics
+            val audioDurationMs = wav.size.let { bytes ->
+                // WAV header is 44 bytes; 16 kHz mono 16-bit => 32 bytes/ms.
+                val pcm = (bytes - 44).coerceAtLeast(0)
+                if (pcm > 0) pcm / 32.0 else null
+            }
+            val payload = JSONObject().apply {
+                turnId?.let { put("turn_id", it) }
+                    ?: m?.turnId?.let { put("turn_id", it) }
+                put("record_ms", recordMs)
+                put("audio_duration_ms", audioDurationMs)
+                put("request_to_first_audio_ms", m?.firstAudioMs ?: JSONObject.NULL)
+                put("first_chunk_play_ms", firstChunkPlayMs ?: JSONObject.NULL)
+                put("total_play_ms", totalPlayMs ?: JSONObject.NULL)
+                put("chunks", m?.chunks ?: 0)
+                put("app_version", BuildConfig.VERSION_NAME)
+                put("device_model", Build.MODEL)
+                put("android_sdk", Build.VERSION.SDK_INT)
+                put("network", networkType(ctx))
+            }
+            NanobotClient(Prefs.serverUrl(ctx), Prefs.token(ctx)).report(
+                Prefs.clientId(ctx), Prefs.token(ctx), payload
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Telemetria ignorada: ${t.message}")
+        }
+    }
+
+    /** Best-effort connectivity label for telemetry: "wifi", "mobile" or "none". */
+    private fun networkType(ctx: Context): String {
+        return try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as? android.net.ConnectivityManager ?: return "unknown"
+            val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+                ?: return "none"
+            when {
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "mobile"
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                else -> "other"
+            }
+        } catch (_: Throwable) {
+            "unknown"
         }
     }
 
