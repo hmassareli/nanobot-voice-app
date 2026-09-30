@@ -161,10 +161,11 @@ class NanobotClient(
         onText: (String) -> Unit,
         onAudioChunk: (ByteArray) -> Unit,
         onTurnId: ((String) -> Unit)? = null,
+        onPlay: ((String) -> Unit)? = null,
         audioFormat: String = "wav"
     ): StreamMetrics = streamRequest(
         buildMultipart(audioBytes, voice, llmModel, audioFormat),
-        onText, onAudioChunk, onTurnId
+        onText, onAudioChunk, onTurnId, onPlay
     ) { fallback ->
         // Old server without /ask_stream — fall back to the plain endpoint.
         val result = ask(audioBytes, voice, llmModel, audioFormat)
@@ -186,7 +187,8 @@ class NanobotClient(
         llmModel: String?,
         onText: (String) -> Unit,
         onAudioChunk: (ByteArray) -> Unit,
-        onTurnId: ((String) -> Unit)? = null
+        onTurnId: ((String) -> Unit)? = null,
+        onPlay: ((String) -> Unit)? = null
     ): StreamMetrics {
         val json = JSONObject().apply {
             put("text", text)
@@ -194,7 +196,7 @@ class NanobotClient(
             if (!llmModel.isNullOrBlank()) put("llm", llmModel)
         }
         val body = json.toString().toRequestBody("application/json".toMediaType())
-        return streamRequest(body, onText, onAudioChunk, onTurnId) { fallback ->
+        return streamRequest(body, onText, onAudioChunk, onTurnId, onPlay) { fallback ->
             // No /ask_stream: use the non-streaming /ask with the same JSON body.
             val result = askJson(json)
             if (result.text.isNotBlank()) onText(result.text)
@@ -214,6 +216,7 @@ class NanobotClient(
         onText: (String) -> Unit,
         onAudioChunk: (ByteArray) -> Unit,
         onTurnId: ((String) -> Unit)?,
+        onPlay: ((String) -> Unit)?,
         onFallback: (noteChunk: (ByteArray) -> Unit) -> String?
     ): StreamMetrics {
         val t0 = System.currentTimeMillis()
@@ -277,6 +280,10 @@ class NanobotClient(
                             }
                             if (bytes.isNotEmpty()) noteChunk(bytes)
                         }
+                    }
+                    "play" -> {
+                        val path = evt.optString("path", "")
+                        if (path.isNotBlank()) onPlay?.invoke(path)
                     }
                     "done" -> {
                         val id = evt.optString("turn_id", "")
@@ -351,6 +358,34 @@ class NanobotClient(
                 Log.w("NanobotClient", "/report falhou (ignorado): ${t.message}")
             }
         }.apply { isDaemon = true }.start()
+    }
+
+    /**
+     * Downloads an audio file from the server (`GET /audio?path=...`). Used to
+     * fetch audio enqueued by server-side tools (e.g. a book excerpt) so the
+     * phone can play it in full before returning to the conversation flow.
+     * Returns an empty array on any failure (never throws).
+     */
+    fun fetchAudio(path: String): ByteArray {
+        return try {
+            val encoded = java.net.URLEncoder.encode(path, "UTF-8")
+            val reqBuilder = Request.Builder()
+                .url("$baseUrl/audio?path=$encoded")
+                .get()
+            if (token.isNotBlank()) reqBuilder.header("Authorization", "Bearer $token")
+            if (!clientId.isNullOrBlank()) reqBuilder.header("X-Client-Id", clientId)
+            http.newCall(reqBuilder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    Log.w("NanobotClient", "/audio HTTP ${resp.code} para $path")
+                    ByteArray(0)
+                } else {
+                    resp.body?.bytes() ?: ByteArray(0)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e("NanobotClient", "fetchAudio falhou para $path", t)
+            ByteArray(0)
+        }
     }
 
     private fun buildMultipart(

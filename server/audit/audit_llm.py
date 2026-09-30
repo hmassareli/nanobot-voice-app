@@ -2,7 +2,7 @@
 """Direct OpenRouter benchmark: separate network/TTFT from model generation."""
 import json, time, urllib.request, os
 
-KEY = "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"
+KEY = os.environ.get("OPENROUTER_API_KEY", "")
 URL = "https://openrouter.ai/api/v1/chat/completions"
 
 def bench(model, prompt, reasoning=None, n=3):

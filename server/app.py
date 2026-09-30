@@ -2,10 +2,20 @@
 
 Endpoints:
   GET  /health           -> {"status":"ok"}
+  GET  /voices           -> selectable voices
+  GET  /audio?path=...   -> serve an audio file from the workspace (Bearer auth)
+  POST /tts              -> text -> audio, NO LLM (Bearer auth)
   POST /ask              -> transcribe (optional) + run agent + TTS
                             Accepts multipart "audio" (WAV) OR JSON {"text": "..."}.
                             Auth: Authorization: Bearer <VOICE_TOKEN>
   POST /ask_stream       -> same input, NDJSON streaming (sentence-level audio)
+  GET  /logs, /logs/summary, POST /report -> telemetry
+
+Agent tools: read_file, list_dir, exec, curl, play_audio, ouvir_livro.
+  * play_audio  -> enqueue an existing audio file (or TTS of `text`) to be
+                   played on the phone; the stream emits a {"type":"play"} event.
+  * ouvir_livro -> synthesize the next book excerpt with the local voice engine
+                   (no LLM tokens) and enqueue it for playback.
 
 Pipeline: STT (Groq Whisper -> faster-whisper local) ->
           nanobot-style agent (OpenRouter, streaming SSE, workspace tools) ->
@@ -40,7 +50,7 @@ from pathlib import Path
 import re
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import telemetry
@@ -211,6 +221,67 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "play_audio",
+            "description": (
+                "Toca um arquivo de áudio no alto-falante do celular do usuário. "
+                "Use quando ele pedir para OUVIR um áudio/livro. O áudio toca por "
+                "completo e depois a conversa continua normalmente."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Caminho do arquivo de áudio no workspace (absoluto ou "
+                            "relativo). Ex.: skills/audio/livro-0001-0001.ogg"
+                        ),
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "Texto a ser sintetizado e tocado, quando não há um "
+                            "arquivo pronto. Opcional."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ouvir_livro",
+            "description": (
+                "Gera em voz o próximo trecho do livro (ou o trecho indicado) "
+                "usando o motor de voz local, SEM gastar tokens de LLM, e toca o "
+                "áudio no celular do usuário. Use quando ele pedir para "
+                "ouvir/continuar o livro."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {
+                        "type": "string",
+                        "description": "Slug do livro (opcional se só houver um).",
+                    },
+                    "trechos": {
+                        "type": "integer",
+                        "description": "Quantos trechos juntar (padrão 1).",
+                    },
+                    "voz": {
+                        "type": "string",
+                        "description": "Voz: santa|dora|alex (padrão santa).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -219,6 +290,127 @@ def _safe(path: str) -> Path:
     if WORKSPACE.resolve() not in p.parents and p != WORKSPACE.resolve():
         raise ValueError("path outside workspace")
     return p
+
+
+# Sentinel returned by tools that want the streaming loop to enqueue an audio
+# file for playback on the phone instead of speaking the tool result aloud.
+PLAY_AUDIO_PREFIX = "__PLAY_AUDIO__:"
+
+
+def _resolve_audio_path(path: str) -> Path:
+    """Resolve a workspace audio path (absolute inside the workspace OR relative
+    to it) and validate it stays inside the workspace. Raises ValueError."""
+    raw = (path or "").strip()
+    if not raw:
+        raise ValueError("caminho vazio")
+    p = Path(raw)
+    if not p.is_absolute():
+        p = WORKSPACE / p
+    p = p.resolve()
+    ws = WORKSPACE.resolve()
+    if ws not in p.parents and p != ws:
+        raise ValueError("path outside workspace")
+    return p
+
+
+async def _tool_play_audio(args: dict) -> str:
+    """Tool `play_audio`: enqueue an existing file, or TTS `text` to a temp file.
+
+    Returns the `__PLAY_AUDIO__:<host path>` sentinel on success."""
+    path = (args.get("path") or "").strip()
+    text = (args.get("text") or "").strip()
+    if path:
+        p = _resolve_audio_path(path)
+        if not p.exists() or not p.is_file():
+            return f"erro: arquivo não encontrado: {path}"
+        return f"{PLAY_AUDIO_PREFIX}{p}"
+    if text:
+        voice = args.get("voice")
+        data = await tts_to_mp3_bytes(text, voice)
+        if not data:
+            return "erro: falha ao sintetizar o áudio"
+        out_dir = WORKSPACE / "skills" / "audio"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"_tts_{uuid.uuid4().hex}.mp3"
+        out.write_bytes(data)
+        return f"{PLAY_AUDIO_PREFIX}{out}"
+    return "erro: informe 'path' ou 'text'"
+
+
+async def _tool_ouvir_livro(args: dict) -> str:
+    """Tool `ouvir_livro`: run the book reader script (local TTS, no LLM) and
+    enqueue the generated audio. Returns the sentinel + a short summary."""
+    slug = (args.get("slug") or "").strip()
+    try:
+        trechos = int(args.get("trechos") or 1)
+    except (TypeError, ValueError):
+        trechos = 1
+    trechos = max(1, trechos)
+    voz = (args.get("voz") or "santa").strip() or "santa"
+
+    script = WORKSPACE / "skills" / "leitor-livros" / "scripts" / "livro_voz.py"
+    if not script.exists():
+        return f"erro: script do leitor de livros não encontrado ({script})"
+
+    cmd = ["python3", str(script), "ouvir"]
+    if slug:
+        cmd.append(slug)
+    cmd += ["--trechos", str(trechos), "--voz", voz]
+
+    def _run() -> subprocess.CompletedProcess:
+        # Synthesis is slow (Kokoro on CPU, ~60s per excerpt) — generous timeout.
+        return subprocess.run(
+            cmd, cwd=str(WORKSPACE), capture_output=True, text=True, timeout=300,
+        )
+
+    try:
+        r = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        return "erro: a geração do áudio do livro demorou demais (timeout de 300s)"
+
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        return f"erro ao gerar o áudio do livro: {out[-500:]}"
+
+    # The script prints the generated file path on the last line as ARQUIVO:<path>.
+    caminho = None
+    for line in reversed((r.stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith("ARQUIVO:"):
+            caminho = line[len("ARQUIVO:"):].strip()
+            break
+    if not caminho:
+        return f"erro: não encontrei o arquivo gerado. Saída: {out[-500:]}"
+    if not os.path.exists(caminho):
+        return f"erro: arquivo gerado não existe: {caminho}"
+
+    # Short spoken summary (title / excerpt range) for the model to comment on.
+    resumo = ""
+    for line in (r.stdout or "").splitlines():
+        s = line.strip()
+        if s.startswith("Trechos ") or s.startswith("==="):
+            resumo = s
+            break
+    return f"{PLAY_AUDIO_PREFIX}{caminho}\n{resumo}".strip()
+
+
+def _handle_tool_output(out: str, stats: dict) -> str:
+    """Post-process a tool result before feeding it back to the model.
+
+    If the result is a `__PLAY_AUDIO__:<path>` sentinel, register the path in
+    `stats["play_audio"]` (so the HTTP layer can emit a `play` event) and return
+    a short message for the model instead of the raw sentinel (which must never
+    be spoken aloud)."""
+    if isinstance(out, str) and out.startswith(PLAY_AUDIO_PREFIX):
+        first, _, rest = out.partition("\n")
+        path = first[len(PLAY_AUDIO_PREFIX):].strip()
+        if path:
+            stats.setdefault("play_audio", []).append(path)
+        msg = "Áudio enfileirado para tocar no celular."
+        if rest.strip():
+            msg += f" {rest.strip()}"
+        return msg
+    return out
 
 
 async def dispatch_tool(name: str, args: dict) -> str:
@@ -236,6 +428,10 @@ async def dispatch_tool(name: str, args: dict) -> str:
                 capture_output=True, text=True, timeout=30,
             )
             return (r.stdout + r.stderr)[:8000] or "(sem saída)"
+        if name == "play_audio":
+            return await _tool_play_audio(args)
+        if name == "ouvir_livro":
+            return await _tool_ouvir_livro(args)
         if name == "curl":
             url = (args.get("url") or "").strip()
             if not url:
@@ -390,6 +586,7 @@ async def run_agent(user_text: str, model: str | None = None,
                 except json.JSONDecodeError:
                     targs = {}
                 out = await dispatch_tool(fn, targs)
+                out = _handle_tool_output(out, stats)
                 stats.setdefault("tool_outputs", []).append(
                     {"name": fn, "out": (out or "")[:400]}
                 )
@@ -510,6 +707,7 @@ async def stream_agent(user_text: str, model: str | None = None,
                     except json.JSONDecodeError:
                         targs = {}
                     out = await dispatch_tool(s["name"], targs)
+                    out = _handle_tool_output(out, stats)
                     stats.setdefault("tool_outputs", []).append(
                         {"name": s["name"], "out": (out or "")[:400]}
                     )
@@ -974,6 +1172,94 @@ async def voices():
     }
 
 
+@app.get("/audio")
+async def audio(request: Request, path: str = ""):
+    """Serve an audio file from the workspace (Bearer auth).
+
+    `path` may be absolute inside the workspace or relative to it. Path traversal
+    is blocked by `_resolve_audio_path`. Content-type is chosen by extension.
+    """
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        p = _resolve_audio_path(path)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if not p.exists() or not p.is_file():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    ext = p.suffix.lower()
+    media = {
+        ".ogg": "audio/ogg",
+        ".opus": "audio/ogg",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+    }.get(ext, "application/octet-stream")
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        return JSONResponse({"error": f"read failed: {e}"}, status_code=500)
+    return Response(content=data, media_type=media)
+
+
+@app.post("/tts")
+async def tts(request: Request):
+    """Sintetiza texto -> áudio SEM passar pelo LLM.
+
+    Usado pelo leitor de livros (e por qualquer cliente que queira só a voz).
+    O texto vai direto para o motor de TTS (Kokoro/edge), sem gastar tokens.
+
+    Body JSON: {"text": "...", "voice": "santa", "format": "mp3"|"ogg"}
+    Retorna o áudio cru (audio/mpeg ou audio/ogg) no corpo da resposta.
+    """
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    text = (body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "empty text"}, status_code=400)
+    voice = body.get("voice")
+    fmt = (body.get("format") or "mp3").lower()
+
+    t0 = time.perf_counter()
+    mp3 = await tts_to_mp3_bytes(text, voice)
+    if not mp3:
+        return JSONResponse({"error": "tts failed"}, status_code=500)
+
+    if fmt == "ogg":
+        data = await _mp3_to_ogg(mp3)
+        if not data:
+            return JSONResponse({"error": "ogg transcode failed"}, status_code=500)
+        media = "audio/ogg"
+    else:
+        data = mp3
+        media = "audio/mpeg"
+
+    log.info("tts %d chars -> %d bytes (%s) in %.0fms",
+             len(text), len(data), fmt, (time.perf_counter() - t0) * 1000)
+    return Response(content=data, media_type=media)
+
+
+async def _mp3_to_ogg(mp3: bytes) -> bytes:
+    """MP3 -> OGG/Opus (WhatsApp voice-note format) via ffmpeg."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+        "-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1",
+        "-f", "ogg", "pipe:1",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate(mp3)
+    if proc.returncode != 0:
+        log.warning("ffmpeg MP3->OGG failed: %s", err[:200])
+        return b""
+    return out
+
+
 @app.on_event("startup")
 async def _warmup():
     """Warm the Kokoro pipeline + edge-tts TLS so the first real request isn't
@@ -1214,7 +1500,8 @@ async def ask(request: Request):
     _record(answer, llm_block=llm_block, tts_block=tts_block)
 
     return {"text": answer, "audio_base64": audio_b64, "timings": timing,
-            "turn_id": turn_id}
+            "turn_id": turn_id,
+            "play_audio": llm_stats.get("play_audio") or []}
 
 
 @app.post("/ask_stream")
@@ -1395,6 +1682,13 @@ async def ask_stream(request: Request):
             answer = "".join(full_answer).strip()
             yield json.dumps({"type": "text", "text": answer}) + "\n"
 
+            # Audio files enqueued by tools (play_audio / ouvir_livro): emit one
+            # `play` event per file so the client downloads and plays them in
+            # order, then returns to the normal conversation flow.
+            play_audio = llm_stats.get("play_audio") or []
+            for i, p in enumerate(play_audio):
+                yield json.dumps({"type": "play", "path": p, "index": i}) + "\n"
+
             llm_ms = (time.perf_counter() - t_llm) * 1000
             total_ms = (time.perf_counter() - t_start) * 1000
             timings = {
@@ -1439,7 +1733,8 @@ async def ask_stream(request: Request):
                 "timings": timings,
             })
             yield json.dumps({"type": "done", "timings": timings,
-                              "turn_id": turn_id}) + "\n"
+                              "turn_id": turn_id,
+                              "play_audio": llm_stats.get("play_audio") or []}) + "\n"
         except Exception as e:  # noqa: BLE001
             log.exception("ask_stream failed")
             yield json.dumps({"type": "error", "message": str(e)}) + "\n"
