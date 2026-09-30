@@ -39,6 +39,7 @@ import base64
 import json
 import logging
 import os
+import signal
 import subprocess
 import tempfile
 import threading
@@ -296,6 +297,82 @@ def _safe(path: str) -> Path:
 # file for playback on the phone instead of speaking the tool result aloud.
 PLAY_AUDIO_PREFIX = "__PLAY_AUDIO__:"
 
+# --- heavy-work serialization ----------------------------------------------
+# Kokoro TTS runs on a single-worker thread pool (see _get_kokoro_executor), so
+# every synthesis request — a spoken sentence OR a book excerpt — queues behind
+# the others. Worse, the book reader (`livro_voz.py`) is a *separate* process
+# that loads its own Kokoro model and burns ~6 CPU cores; if several turns ask
+# for a book at once (or the user retries because nothing played), those
+# processes pile up and starve the whole server (health checks time out).
+#
+# This lock makes book generation strictly one-at-a-time: a second request
+# waits instead of spawning another CPU-hungry process. It is a plain
+# threading.Lock because the work happens in a worker thread (asyncio.to_thread).
+_BOOK_LOCK = threading.Lock()
+
+# Hard ceiling for one book generation. The script itself is also wrapped in
+# `timeout` so a wedged Kokoro can never leak a process forever.
+BOOK_TIMEOUT_S = int(os.environ.get("BOOK_TIMEOUT_S", "240"))
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Best-effort kill of a process and all its children (the book script
+    spawns ffmpeg). Uses the process group so nothing is left behind."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _run_book_script(cmd: list[str]) -> tuple[int, str, str]:
+    """Run the book reader in its own process group with a hard timeout.
+
+    Returns (returncode, stdout, stderr). On timeout the whole group is killed
+    and returncode is -9. Never raises for a timeout — the caller turns it into
+    a friendly message.
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=str(WORKSPACE), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=BOOK_TIMEOUT_S)
+        return proc.returncode, out or "", err or ""
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:  # noqa: BLE001
+            out, err = "", ""
+        return -9, out or "", (err or "") + f"\n[timeout após {BOOK_TIMEOUT_S}s]"
+
+
+def _run_exec(cmd: str) -> str:
+    """Run a shell command for the `exec` tool in its own process group.
+
+    Uses a hard timeout and kills the whole group on expiry so a command that
+    spawns children (e.g. a long-running python) can never leak a process and
+    starve the server."""
+    proc = subprocess.Popen(
+        cmd, shell=True, cwd=str(WORKSPACE), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=30)
+        return ((out or "") + (err or ""))[:8000] or "(sem saída)"
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:  # noqa: BLE001
+            out, err = "", ""
+        return (((out or "") + (err or ""))[:8000] + "\n[comando cancelado: timeout de 30s]").strip()
+
 
 def _resolve_audio_path(path: str) -> Path:
     """Resolve a workspace audio path (absolute inside the workspace OR relative
@@ -339,59 +416,68 @@ async def _tool_play_audio(args: dict) -> str:
 
 async def _tool_ouvir_livro(args: dict) -> str:
     """Tool `ouvir_livro`: run the book reader script (local TTS, no LLM) and
-    enqueue the generated audio. Returns the sentinel + a short summary."""
+    enqueue the generated audio. Returns the sentinel + a short summary.
+
+    Generation is serialized by `_BOOK_LOCK`: only one book process runs at a
+    time. If another is already running we return immediately (instead of
+    stacking a second CPU-hungry process) so the model can tell the user to
+    wait a moment."""
     slug = (args.get("slug") or "").strip()
     try:
         trechos = int(args.get("trechos") or 1)
     except (TypeError, ValueError):
         trechos = 1
-    trechos = max(1, trechos)
+    # Cap the batch: each excerpt costs ~60s of CPU synthesis, and the phone's
+    # HTTP read timeout is finite. More than a couple at once would exceed it and
+    # the user would hear nothing.
+    trechos = max(1, min(trechos, 2))
     voz = (args.get("voz") or "santa").strip() or "santa"
 
     script = WORKSPACE / "skills" / "leitor-livros" / "scripts" / "livro_voz.py"
     if not script.exists():
         return f"erro: script do leitor de livros não encontrado ({script})"
 
-    cmd = ["python3", str(script), "ouvir"]
-    if slug:
-        cmd.append(slug)
-    cmd += ["--trechos", str(trechos), "--voz", voz]
-
-    def _run() -> subprocess.CompletedProcess:
-        # Synthesis is slow (Kokoro on CPU, ~60s per excerpt) — generous timeout.
-        return subprocess.run(
-            cmd, cwd=str(WORKSPACE), capture_output=True, text=True, timeout=300,
-        )
+    # Non-blocking: never queue a second heavy process behind the first.
+    if not _BOOK_LOCK.acquire(blocking=False):
+        return ("já estou gerando um trecho do livro agora; "
+                "aguarde alguns segundos e peça de novo.")
 
     try:
-        r = await asyncio.to_thread(_run)
-    except subprocess.TimeoutExpired:
-        return "erro: a geração do áudio do livro demorou demais (timeout de 300s)"
+        cmd = ["python3", str(script), "ouvir"]
+        if slug:
+            cmd.append(slug)
+        cmd += ["--trechos", str(trechos), "--voz", voz]
 
-    out = (r.stdout or "") + (r.stderr or "")
-    if r.returncode != 0:
-        return f"erro ao gerar o áudio do livro: {out[-500:]}"
+        rcode, out, err = await asyncio.to_thread(_run_book_script, cmd)
+        combined = (out or "") + (err or "")
+        if rcode != 0:
+            if rcode == -9:
+                return ("erro: a geração do áudio do livro demorou demais "
+                        f"(limite de {BOOK_TIMEOUT_S}s) e foi cancelada.")
+            return f"erro ao gerar o áudio do livro: {combined[-500:]}"
 
-    # The script prints the generated file path on the last line as ARQUIVO:<path>.
-    caminho = None
-    for line in reversed((r.stdout or "").splitlines()):
-        line = line.strip()
-        if line.startswith("ARQUIVO:"):
-            caminho = line[len("ARQUIVO:"):].strip()
-            break
-    if not caminho:
-        return f"erro: não encontrei o arquivo gerado. Saída: {out[-500:]}"
-    if not os.path.exists(caminho):
-        return f"erro: arquivo gerado não existe: {caminho}"
+        # The script prints the generated file path on the last line as ARQUIVO:<path>.
+        caminho = None
+        for line in reversed((out or "").splitlines()):
+            line = line.strip()
+            if line.startswith("ARQUIVO:"):
+                caminho = line[len("ARQUIVO:"):].strip()
+                break
+        if not caminho:
+            return f"erro: não encontrei o arquivo gerado. Saída: {combined[-500:]}"
+        if not os.path.exists(caminho):
+            return f"erro: arquivo gerado não existe: {caminho}"
 
-    # Short spoken summary (title / excerpt range) for the model to comment on.
-    resumo = ""
-    for line in (r.stdout or "").splitlines():
-        s = line.strip()
-        if s.startswith("Trechos ") or s.startswith("==="):
-            resumo = s
-            break
-    return f"{PLAY_AUDIO_PREFIX}{caminho}\n{resumo}".strip()
+        # Short spoken summary (title / excerpt range) for the model to comment on.
+        resumo = ""
+        for line in (out or "").splitlines():
+            s = line.strip()
+            if s.startswith("Trechos ") or s.startswith("==="):
+                resumo = s
+                break
+        return f"{PLAY_AUDIO_PREFIX}{caminho}\n{resumo}".strip()
+    finally:
+        _BOOK_LOCK.release()
 
 
 def _handle_tool_output(out: str, stats: dict) -> str:
@@ -423,11 +509,7 @@ async def dispatch_tool(name: str, args: dict) -> str:
             return "\n".join(sorted(x.name for x in p.iterdir()))[:4000]
         if name == "exec":
             cmd = args.get("command", "")
-            r = subprocess.run(
-                cmd, shell=True, cwd=str(WORKSPACE),
-                capture_output=True, text=True, timeout=30,
-            )
-            return (r.stdout + r.stderr)[:8000] or "(sem saída)"
+            return await asyncio.to_thread(_run_exec, cmd)
         if name == "play_audio":
             return await _tool_play_audio(args)
         if name == "ouvir_livro":

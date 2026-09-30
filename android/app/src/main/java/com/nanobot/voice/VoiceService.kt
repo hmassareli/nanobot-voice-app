@@ -208,8 +208,11 @@ class VoiceService : Service() {
         var recordMs = System.currentTimeMillis() - rec0
 
         while (active) {
-            askAndPlay(ctx, rec, recordMs)
+            val ok = askAndPlay(ctx, rec, recordMs)
             if (!active) return
+            // A failed turn (server down, timeout) ends the conversation instead
+            // of silently re-opening the follow-up window.
+            if (!ok) return
 
             val followUpSeconds = Prefs.followUpSeconds(ctx)
             if (followUpSeconds <= 0) return
@@ -232,8 +235,9 @@ class VoiceService : Service() {
             }
 
         while (active) {
-            askAndPlayText(ctx, turn)
+            val ok = askAndPlayText(ctx, turn)
             if (!active) return
+            if (!ok) return
 
             val followUpSeconds = Prefs.followUpSeconds(ctx)
             if (followUpSeconds <= 0) return
@@ -294,8 +298,8 @@ class VoiceService : Service() {
     }
 
     /** Sends [rec] to the backend and streams the spoken answer. */
-    private suspend fun askAndPlay(ctx: Context, rec: RecordedAudio, recordMs: Long) {
-        runTurn(
+    private suspend fun askAndPlay(ctx: Context, rec: RecordedAudio, recordMs: Long): Boolean {
+        return runTurn(
             ctx = ctx,
             anchorEpochMs = rec.speechEndEpochMs,
             recordMs = recordMs,
@@ -315,8 +319,8 @@ class VoiceService : Service() {
     }
 
     /** Sends the on-device transcript to the backend and streams the answer. */
-    private suspend fun askAndPlayText(ctx: Context, turn: StreamedTurn) {
-        runTurn(
+    private suspend fun askAndPlayText(ctx: Context, turn: StreamedTurn): Boolean {
+        return runTurn(
             ctx = ctx,
             anchorEpochMs = turn.speechEndEpochMs,
             recordMs = turn.speechEndEpochMs - turn.listenStartEpochMs,
@@ -355,7 +359,7 @@ class VoiceService : Service() {
             onTurnId: (String) -> Unit,
             onPlay: (String) -> Unit
         ) -> StreamMetrics
-    ) {
+    ): Boolean {
         updateNotification("Pensando…")
 
         // Audio files the server asked us to play in full (e.g. a book excerpt
@@ -407,6 +411,7 @@ class VoiceService : Service() {
 
         var metrics: StreamMetrics? = null
         var turnId: String? = null
+        var failed = false
         // Wall-clock instant we hand the request to the HTTP client. The gap
         // between this and anchorEpochMs is the local "turnaround" cost
         // (encoder.finish + multipart build + socket write).
@@ -432,6 +437,7 @@ class VoiceService : Service() {
                 { path -> playPaths.add(path) }
             )
         } catch (t: Throwable) {
+            failed = true
             Log.e(TAG, "Erro no backend", t)
             updateNotification("Erro ao falar com o servidor: ${t.message}")
         } finally {
@@ -519,6 +525,12 @@ class VoiceService : Service() {
         } catch (t: Throwable) {
             Log.w(TAG, "Telemetria ignorada: ${t.message}")
         }
+
+        // A failed turn must NOT silently fall back into the follow-up window:
+        // that is what made the app look like it was "listening forever" after
+        // the server died. Returning false tells the caller to stop the loop and
+        // go back to the wake word.
+        return !failed
     }
 
     /** Records an utterance; returns null when nothing (loud enough) was said. */
