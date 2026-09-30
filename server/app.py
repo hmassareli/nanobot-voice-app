@@ -138,6 +138,10 @@ def build_system_prompt() -> str:
         "list_dir, exec (shell) e curl (requisições HTTP). Use-as quando precisar "
         "consultar arquivos, o ambiente ou a internet. Caminhos são relativos ao "
         "workspace (/workspace).",
+        "Para OUVIR/continuar um livro, use SEMPRE a ferramenta ouvir_livro_stream "
+        "(toca o próximo trecho parágrafo a parágrafo, começando em poucos "
+        "segundos). Só use ouvir_livro se a primeira falhar. Depois de chamar a "
+        "ferramenta, responda apenas algo curto como 'Tocando o próximo trecho.'",
     ]
     # SOUL.md gives the same personality as the main nanobot; USER.md carries the
     # user's profile/preferences. AGENTS.md is deliberately skipped: it documents
@@ -273,6 +277,36 @@ TOOLS = [
                     "trechos": {
                         "type": "integer",
                         "description": "Quantos trechos juntar (padrão 1).",
+                    },
+                    "voz": {
+                        "type": "string",
+                        "description": "Voz: santa|dora|alex (padrão santa).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ouvir_livro_stream",
+            "description": (
+                "PREFERIDA para ouvir/continuar o livro. Toca o próximo trecho em "
+                "voz, PARÁGRAFO A PARÁGRAFO, começando a falar em ~2-3s (em vez de "
+                "esperar o trecho inteiro). Use SEMPRE que o usuário pedir para "
+                "ouvir, tocar ou continuar o livro. Não gasta tokens de LLM."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {
+                        "type": "string",
+                        "description": "Slug do livro (opcional se só houver um).",
+                    },
+                    "trechos": {
+                        "type": "integer",
+                        "description": "Quantos trechos (1 ou 2; padrão 1).",
                     },
                     "voz": {
                         "type": "string",
@@ -480,6 +514,183 @@ async def _tool_ouvir_livro(args: dict) -> str:
         _BOOK_LOCK.release()
 
 
+# --- book streaming (in-process, paragraph by paragraph) -------------------
+# Sentinel returned by the `ouvir_livro_stream` tool. It carries the request
+# parameters (slug/voz/trechos); the /ask_stream loop turns them into actual
+# audio AFTER speaking the model's short reply. The tool itself does no work,
+# so the model never blocks on synthesis.
+BOOK_STREAM_PREFIX = "__BOOK_STREAM__:"
+LIVROS_DIR = WORKSPACE / "skills" / "livros"
+
+
+def _listar_livros() -> list[str]:
+    """Slugs de livros disponíveis (subpastas com trechos.json)."""
+    try:
+        return sorted(
+            p.name for p in LIVROS_DIR.iterdir()
+            if p.is_dir() and (p / "trechos.json").exists()
+        )
+    except OSError:
+        return []
+
+
+def _resolver_slug_livro(slug: str) -> str:
+    """Resolve o slug: usa o informado; se vazio e houver um único livro, usa-o;
+    senão levanta ValueError com uma mensagem amigável."""
+    slug = (slug or "").strip()
+    if slug:
+        return slug
+    itens = _listar_livros()
+    if len(itens) == 1:
+        return itens[0]
+    raise ValueError(
+        "especifique o slug do livro. Livros: " + (", ".join(itens) or "nenhum")
+    )
+
+
+def _split_paragrafos(texto: str, max_par: int = 300) -> list[str]:
+    """Divide o texto do trecho em PARÁGRAFOS (linhas em branco). Parágrafos
+    muito longos são subdivididos em sentenças, para o PRIMEIRO áudio sair o
+    quanto antes (o usuário espera ~2-3s, não ~65s)."""
+    partes = [p.strip() for p in re.split(r"\n\s*\n", texto or "")]
+    partes = [p for p in partes if p]
+    out: list[str] = []
+    for p in partes:
+        if len(p) <= max_par:
+            out.append(p)
+        else:
+            out.extend(split_sentences(p, max_len=200))
+    return out
+
+
+async def stream_book_excerpt(slug: str, voz: str, trechos: int, stats: dict):
+    """Streaming EM PROCESSO de um trecho do livro, parágrafo a parágrafo.
+
+    Reusa o Kokoro já carregado/aquecido no servidor (`tts_to_mp3_bytes`), sem
+    subprocesso e sem carregar um modelo novo — é isso que derruba a latência do
+    primeiro áudio de ~65s (trecho inteiro) para ~2-3s (primeiro parágrafo).
+
+    Emite eventos NDJSON: um `{"type":"audio",...}` por parágrafo (assim que
+    fica pronto), um `{"type":"text","text":<resumo>}` no fim e, em erro, um
+    `{"type":"error","message":...}`. NÃO emite `done` (o chamador faz isso).
+
+    Toda a geração é serializada por `_BOOK_LOCK` (aquisição não-bloqueante): se
+    outra já está em curso, devolve uma mensagem amigável e sai sem áudio, em vez
+    de empilhar trabalho pesado e derrubar o servidor.
+    """
+    try:
+        slug = _resolver_slug_livro(slug)
+    except ValueError as e:
+        yield json.dumps({"type": "text", "text": str(e)}) + "\n"
+        return
+
+    base = LIVROS_DIR / slug
+    try:
+        dados = json.loads((base / "trechos.json").read_text(encoding="utf-8"))
+        estado = json.loads((base / "estado.json").read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        yield json.dumps({
+            "type": "text",
+            "text": f"não consegui abrir o livro {slug}: {e}",
+        }) + "\n"
+        return
+
+    todos = dados.get("trechos") or []
+    try:
+        i = int(estado.get("trecho") or 0)
+    except (TypeError, ValueError):
+        i = 0
+    if i >= len(todos):
+        yield json.dumps({
+            "type": "text",
+            "text": f"Fim do livro: {estado.get('titulo') or slug}.",
+        }) + "\n"
+        return
+
+    # No máximo 2 trechos por vez (cada um ~1500 chars; mais que isso estoura o
+    # read timeout do cliente).
+    try:
+        n = max(1, min(int(trechos or 1), 2))
+    except (TypeError, ValueError):
+        n = 1
+    selecionados = todos[i:i + n]
+    voz = (voz or "santa").strip() or "santa"
+
+    # Não-bloqueante: nunca empilha uma segunda geração pesada.
+    if not _BOOK_LOCK.acquire(blocking=False):
+        yield json.dumps({
+            "type": "text",
+            "text": ("já estou gerando um trecho do livro agora; "
+                     "aguarde alguns segundos e peça de novo."),
+        }) + "\n"
+        return
+
+    try:
+        index = 0
+        t0 = time.perf_counter()
+        for t in selecionados:
+            for par in _split_paragrafos(t.get("texto") or ""):
+                data = await tts_to_mp3_bytes(par, voz)
+                if not data:
+                    continue
+                yield json.dumps({
+                    "type": "audio",
+                    "data": base64.b64encode(data).decode(),
+                    "index": index,
+                    "text": par,
+                }) + "\n"
+                index += 1
+
+        # Avança a posição só DEPOIS de gerar tudo (assim uma falha no meio não
+        # pula conteúdo).
+        estado["trecho"] = i + len(selecionados)
+        estado["capitulo"] = selecionados[-1].get("cap")
+        estado["paragrafo"] = 0
+        estado["atualizado"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            (base / "estado.json").write_text(
+                json.dumps(estado, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as e:  # noqa: BLE001
+            log.warning("não salvei o estado do livro %s: %s", slug, e)
+
+        titulos = " | ".join(str(x.get("titulo") or "") for x in selecionados)
+        resumo = (f"{estado.get('titulo') or slug}: trechos "
+                  f"{i + 1}-{i + len(selecionados)} de {len(todos)} ({titulos}).")
+        stats["book_stream_done"] = {
+            "slug": slug,
+            "paragrafos": index,
+            "ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+        log.info("book_stream %s trechos %d-%d -> %d parágrafos em %.0fms",
+                 slug, i + 1, i + len(selecionados), index,
+                 (time.perf_counter() - t0) * 1000)
+        yield json.dumps({"type": "text", "text": resumo}) + "\n"
+    except Exception as e:  # noqa: BLE001
+        log.exception("stream_book_excerpt falhou")
+        yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+    finally:
+        _BOOK_LOCK.release()
+
+
+async def _tool_ouvir_livro_stream(args: dict) -> str:
+    """Tool `ouvir_livro_stream`: agenda o streaming EM PROCESSO do próximo
+    trecho do livro (parágrafo a parágrafo, sem subprocesso).
+
+    Não gera áudio aqui: apenas devolve um sentinela que `_handle_tool_output`
+    captura para `stats["book_stream"]`. O /ask_stream sintetiza os parágrafos
+    depois de falar a resposta curta do modelo, para o primeiro áudio chegar em
+    ~2-3s."""
+    slug = (args.get("slug") or "").strip()
+    try:
+        trechos = int(args.get("trechos") or 1)
+    except (TypeError, ValueError):
+        trechos = 1
+    trechos = max(1, min(trechos, 2))
+    voz = (args.get("voz") or "santa").strip() or "santa"
+    return BOOK_STREAM_PREFIX + json.dumps(
+        {"slug": slug, "voz": voz, "trechos": trechos})
+
+
 def _handle_tool_output(out: str, stats: dict) -> str:
     """Post-process a tool result before feeding it back to the model.
 
@@ -496,6 +707,13 @@ def _handle_tool_output(out: str, stats: dict) -> str:
         if rest.strip():
             msg += f" {rest.strip()}"
         return msg
+    if isinstance(out, str) and out.startswith(BOOK_STREAM_PREFIX):
+        try:
+            req = json.loads(out[len(BOOK_STREAM_PREFIX):])
+        except json.JSONDecodeError:
+            req = {}
+        stats["book_stream"] = req
+        return "Vou tocar o próximo trecho do livro agora."
     return out
 
 
@@ -514,6 +732,8 @@ async def dispatch_tool(name: str, args: dict) -> str:
             return await _tool_play_audio(args)
         if name == "ouvir_livro":
             return await _tool_ouvir_livro(args)
+        if name == "ouvir_livro_stream":
+            return await _tool_ouvir_livro_stream(args)
         if name == "curl":
             url = (args.get("url") or "").strip()
             if not url:
@@ -1739,6 +1959,11 @@ async def ask_stream(request: Request):
                     pieces = split_first_chunk(sentence)
                     first_sentence_done = True
                 for piece in pieces:
+                    # Book request: don't speak the model's short reply — the
+                    # book audio is streamed right after, so the FIRST sound the
+                    # user hears is the book itself (saves ~2-4s of Kokoro time).
+                    if llm_stats.get("book_stream"):
+                        continue
                     t_tts = time.perf_counter()
                     data = await tts_to_mp3_bytes(piece, voice)
                     sent_ms = (time.perf_counter() - t_tts) * 1000
@@ -1770,6 +1995,20 @@ async def ask_stream(request: Request):
             play_audio = llm_stats.get("play_audio") or []
             for i, p in enumerate(play_audio):
                 yield json.dumps({"type": "play", "path": p, "index": i}) + "\n"
+
+            # Book streaming (ouvir_livro_stream): synthesize the excerpt
+            # paragraph by paragraph IN-PROCESS (reusing the warm Kokoro) and
+            # stream each paragraph as an `audio` chunk, so the phone starts
+            # speaking in ~2-3s instead of waiting for the whole excerpt.
+            book_req = llm_stats.get("book_stream")
+            if book_req:
+                async for chunk in stream_book_excerpt(
+                    book_req.get("slug", ""),
+                    book_req.get("voz", "santa"),
+                    book_req.get("trechos", 1),
+                    llm_stats,
+                ):
+                    yield chunk
 
             llm_ms = (time.perf_counter() - t_llm) * 1000
             total_ms = (time.perf_counter() - t_start) * 1000
