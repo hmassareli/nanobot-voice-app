@@ -100,6 +100,7 @@ def build_dockerfile() -> str:
         "ENV WORKSPACE=/workspace",
         "ENV WHISPER_MODEL=small",
         "ENV WHISPER_LANGUAGE=pt",
+        "ENV MAX_TOOL_ROUNDS=25",
         f"ENV GROQ_API_KEY={GROQ_KEY}",
         "EXPOSE 8000",
         'CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8000"]',

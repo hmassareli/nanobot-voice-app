@@ -107,7 +107,7 @@ WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace"))
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "pt")
-MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "6"))
+MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "25"))
 
 app = FastAPI(title="nanobot-voice-api")
 
@@ -289,6 +289,47 @@ def _remember(user_text: str, answer: str) -> None:
     del HISTORY[:-MAX_HISTORY]
 
 
+def _remember_overflow(user_text: str, stats: dict | None) -> None:
+    """Guarda no histórico um resumo do que já foi executado quando o limite de
+    rodadas é atingido, para não perder o contexto entre as mensagens."""
+    calls = []
+    outputs = []
+    if stats:
+        calls = stats.get("tool_calls") or []
+        outputs = stats.get("tool_outputs") or []
+    # deduplica mantendo ordem
+    seen, uniq = set(), []
+    for c in calls:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    resumo = ("[CONTEXTO PRESERVADO] A tarefa anterior foi interrompida por atingir "
+              "o limite de rodadas de ferramentas. Ferramentas já usadas: "
+              + (", ".join(uniq) if uniq else "nenhuma") + ".")
+    # Anexa os últimos resultados das ferramentas para o modelo conseguir
+    # retomar de onde parou sem refazer tudo.
+    if outputs:
+        resumo += "\n\nÚltimos resultados obtidos (mais recentes por último):\n"
+        for item in outputs[-6:]:
+            resumo += f"- {item['name']}: {item['out']}\n"
+    resumo += ("\nAo retomar, continue a partir daí sem recomeçar do zero.")
+    HISTORY.append({"role": "user", "content": user_text})
+    HISTORY.append({"role": "assistant", "content": resumo})
+    del HISTORY[:-MAX_HISTORY]
+
+
+def _overflow_message() -> str:
+    """Mensagem falada quando o limite de rodadas de ferramentas é atingido.
+
+    Curta e clara para TTS: explica o que aconteceu, que o contexto foi
+    preservado e o que o usuário deve fazer."""
+    return ("Essa tarefa precisou de mais passos do que eu consigo dar de uma vez "
+            f"só (meu limite é de {MAX_TOOL_ROUNDS} rodadas de ferramentas). "
+            "Já guardei o que fiz até aqui, então não precisa recomeçar. "
+            "Me diga 'continua' que eu sigo de onde parei, ou divida o pedido "
+            "em partes menores.")
+
+
 async def run_agent(user_text: str, model: str | None = None,
                     stats: dict | None = None) -> str:
     """Non-streaming agent (kept for /ask and as a fallback).
@@ -349,12 +390,18 @@ async def run_agent(user_text: str, model: str | None = None,
                 except json.JSONDecodeError:
                     targs = {}
                 out = await dispatch_tool(fn, targs)
+                stats.setdefault("tool_outputs", []).append(
+                    {"name": fn, "out": (out or "")[:400]}
+                )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id"),
                     "content": out,
                 })
-        return "Desculpe, não consegui concluir a solicitação."
+        # Limite atingido: NÃO descarta o contexto. Guarda um resumo do que já
+        # foi executado no histórico, para continuar de onde parou.
+        _remember_overflow(user_text, stats)
+        return _overflow_message()
 
 
 async def stream_agent(user_text: str, model: str | None = None,
@@ -463,6 +510,9 @@ async def stream_agent(user_text: str, model: str | None = None,
                     except json.JSONDecodeError:
                         targs = {}
                     out = await dispatch_tool(s["name"], targs)
+                    stats.setdefault("tool_outputs", []).append(
+                        {"name": s["name"], "out": (out or "")[:400]}
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": s["id"],
@@ -473,7 +523,9 @@ async def stream_agent(user_text: str, model: str | None = None,
             answer = "".join(content_parts).strip()
             _remember(user_text, answer)
             return
-        yield "Desculpe, não consegui concluir a solicitação."
+        # Limite atingido no modo streaming: preserva o contexto executado.
+        _remember_overflow(user_text, stats)
+        yield _overflow_message()
 
 
 # --- STT -------------------------------------------------------------------
