@@ -19,6 +19,24 @@ object Prefs {
     const val KEY_ENABLED = "service_enabled"
     const val KEY_FOLLOW_UP = "follow_up_seconds"
     const val KEY_STT_MODE = "stt_mode"
+    const val KEY_REMINDER_MODE = "reminder_mode"
+    const val KEY_HOME_SSID = "home_ssid"
+
+    /** Como entregar lembretes: voz em casa, sempre voz, só popup ou off. */
+    const val REMINDER_AUTO = "auto"
+    const val REMINDER_VOICE = "voice"
+    const val REMINDER_POPUP = "popup"
+    const val REMINDER_OFF = "off"
+    const val DEFAULT_REMINDER_MODE = REMINDER_AUTO
+
+    val REMINDER_MODE_LABELS = listOf(
+        "Voz quando em casa (padr\u00e3o)",
+        "Sempre por voz",
+        "S\u00f3 notifica\u00e7\u00e3o",
+        "Desligado"
+    )
+    val REMINDER_MODE_VALUES = listOf(
+        REMINDER_AUTO, REMINDER_VOICE, REMINDER_POPUP, REMINDER_OFF)
 
     /** Persisted stable id sent to the backend as the `X-Client-Id` header. */
     const val KEY_CLIENT_ID = "client_id"
@@ -107,6 +125,14 @@ object Prefs {
     fun wakeWord(ctx: Context) = get(ctx).getString(KEY_WAKE_WORD, DEFAULT_WAKE_WORD) ?: DEFAULT_WAKE_WORD
     fun llmModel(ctx: Context) = get(ctx).getString(KEY_LLM_MODEL, DEFAULT_LLM_MODEL) ?: DEFAULT_LLM_MODEL
     fun enabled(ctx: Context) = get(ctx).getBoolean(KEY_ENABLED, false)
+
+    fun reminderMode(ctx: Context): String =
+        get(ctx).getString(KEY_REMINDER_MODE, DEFAULT_REMINDER_MODE)
+            ?: DEFAULT_REMINDER_MODE
+
+    /** SSID do Wi-Fi de casa; quando bate, lembretes sao falados em voz. */
+    fun homeSsid(ctx: Context): String =
+        get(ctx).getString(KEY_HOME_SSID, "") ?: ""
 
     /** Seconds of follow-up listening after a reply (0 = off). */
     fun followUpSeconds(ctx: Context): Int = get(ctx)

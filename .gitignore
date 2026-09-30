@@ -26,3 +26,5 @@ venv/
 .DS_Store
 *.log
 *.bak
+
+logs/

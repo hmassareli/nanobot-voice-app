@@ -39,6 +39,11 @@ import kotlinx.coroutines.launch
  *     and the returned audio is played back.
  *  3. The engine resumes and the loop repeats.
  */
+sealed class VoiceReq {
+    object Wake : VoiceReq()
+    data class Reminder(val id: String, val text: String) : VoiceReq()
+}
+
 class VoiceService : Service() {
 
     /** One recorded utterance: the bytes to upload plus their container format
@@ -60,6 +65,7 @@ class VoiceService : Service() {
         const val ACTION_START = "com.nanobot.voice.START"
         const val ACTION_STOP = "com.nanobot.voice.STOP"
         const val ACTION_TRIGGER = "com.nanobot.voice.TRIGGER"
+        const val ACTION_REMINDER = "com.nanobot.voice.REMINDER"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, VoiceService::class.java).setAction(ACTION_START)
@@ -82,10 +88,23 @@ class VoiceService : Service() {
                 ctx.startService(i)
             }
         }
+
+        /** Dispara a fala de um lembrete (e a escuta da resposta) no servico. */
+        fun speakReminder(ctx: Context, id: String, text: String) {
+            val i = Intent(ctx, VoiceService::class.java)
+                .setAction(ACTION_REMINDER)
+                .putExtra("id", id)
+                .putExtra("text", text)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(i)
+            } else {
+                ctx.startService(i)
+            }
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val requests = Channel<Unit>(Channel.UNLIMITED)
+    private val requests = Channel<VoiceReq>(Channel.UNLIMITED)
 
     @Volatile
     private var active = false
@@ -99,6 +118,7 @@ class VoiceService : Service() {
     override fun onCreate() {
         super.onCreate()
         notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        ReminderReceiver.scheduleSync(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -110,7 +130,15 @@ class VoiceService : Service() {
             ACTION_TRIGGER -> {
                 ensureForeground("Processando pedido…")
                 if (!active) startLoop()
-                requests.trySend(Unit)
+                requests.trySend(VoiceReq.Wake)
+                return START_STICKY
+            }
+            ACTION_REMINDER -> {
+                val rid = intent.getStringExtra("id") ?: ""
+                val rtext = intent.getStringExtra("text") ?: ""
+                ensureForeground("Lembrete: " + rtext.take(50))
+                if (!active) startLoop()
+                requests.trySend(VoiceReq.Reminder(rid, rtext))
                 return START_STICKY
             }
             else -> {
@@ -154,7 +182,7 @@ class VoiceService : Service() {
             val wakeWord = Prefs.wakeWord(ctx)
             val engine = SherpaWakeWordEngine(ctx, wakeWord)
             wakeEngine = engine
-            engine.onWakeWord = { requests.trySend(Unit) }
+            engine.onWakeWord = { requests.trySend(VoiceReq.Wake) }
             engine.start()
             if (engine.isRunning) {
                 updateNotification("Ouvindo… diga \"$wakeWord\"")
@@ -167,12 +195,17 @@ class VoiceService : Service() {
             while (requests.tryReceive().isSuccess) {
                 // drain
             }
-            requests.receive()
+            val req = requests.receive()
 
             engine.stop()
             if (!active) break
 
-            handleRequest(ctx)
+            when (req) {
+                is VoiceReq.Wake -> handleRequest(ctx)
+                is VoiceReq.Reminder -> handleReminder(ctx, req.id, req.text)
+            }
+            // Pos-conversa: um sync barato pega lembretes criados agora.
+            Reminders.syncAsync(ctx)
         }
     }
 
@@ -297,8 +330,66 @@ class VoiceService : Service() {
         return StreamedTurn(text, System.currentTimeMillis(), firstPartialMs, listenStart)
     }
 
+    /**
+     * Entrega um lembrete em voz: fala o texto (TTS do servidor), avisa o
+     * servidor que disparou e FICA TE OUVINDO por uma janela curta para o
+     * usuario responder ("adiar 10 minutos", "ok obrigado"), conversando
+     * normalmente em seguida. O texto do lembrete vai como contexto para o LLM.
+     */
+    private suspend fun handleReminder(ctx: Context, id: String, text: String) {
+        updateNotification("Lembrete: " + text.take(50))
+        val spoken = "Lembrete: $text"
+        val audio = try {
+            NanobotClient(Prefs.serverUrl(ctx), Prefs.token(ctx), clientId = Prefs.clientId(ctx))
+                .tts(spoken, Prefs.voice(ctx))
+        } catch (t: Throwable) {
+            ByteArray(0)
+        }
+        if (audio.isNotEmpty()) {
+            playAudio(audio)
+        } else {
+            Log.w(TAG, "TTS do lembrete falhou; notificando como fallback")
+            ReminderReceiver.notifyPopup(ctx, spoken)
+        }
+        Reminders.markFiredAsync(ctx, id)
+
+        // Espera uma resposta do usuario (mesma janela do follow-up).
+        val listenMs = Prefs.followUpSeconds(ctx) * 1000
+        if (listenMs <= 0) return
+        val reminderContext =
+            "Voce acabou de avisar o usuario: \"" + text + "\". Ele respondeu agora."
+
+        if (Prefs.sttMode(ctx) == Prefs.STT_MODE_STREAMING && StreamingStt.isAvailable(ctx)) {
+            var turn = streamingTurn(ctx, listenMs, countdown = true) ?: return
+            var ctxNote = reminderContext
+            while (active) {
+                val ok = askAndPlayText(ctx, turn, ctxNote)
+                ctxNote = ""
+                if (!ok) return
+                val f = Prefs.followUpSeconds(ctx) * 1000
+                if (f <= 0) return
+                turn = streamingTurn(ctx, f, countdown = true) ?: return
+            }
+        } else {
+            var rec = recordForRequest(listenMs, countdown = true) ?: return
+            var ctxNote = reminderContext
+            var recordMs = listenMs.toLong()
+            while (active) {
+                val ok = askAndPlay(ctx, rec, recordMs, ctxNote)
+                ctxNote = ""
+                if (!ok) return
+                val f = Prefs.followUpSeconds(ctx) * 1000
+                if (f <= 0) return
+                val t0 = System.currentTimeMillis()
+                rec = recordForRequest(f, countdown = true) ?: return
+                recordMs = System.currentTimeMillis() - t0
+            }
+        }
+    }
+
     /** Sends [rec] to the backend and streams the spoken answer. */
-    private suspend fun askAndPlay(ctx: Context, rec: RecordedAudio, recordMs: Long): Boolean {
+    private suspend fun askAndPlay(ctx: Context, rec: RecordedAudio, recordMs: Long,
+                                  context: String = ""): Boolean {
         return runTurn(
             ctx = ctx,
             anchorEpochMs = rec.speechEndEpochMs,
@@ -312,14 +403,16 @@ class VoiceService : Service() {
                     Prefs.serverUrl(ctx), Prefs.token(ctx), clientId = Prefs.clientId(ctx)
                 ).askStream(
                     rec.bytes, Prefs.voice(ctx), Prefs.llmModel(ctx),
-                    onText, onAudioChunk, onTurnId, onPlay, rec.format
+                    onText, onAudioChunk, onTurnId, onPlay, rec.format,
+                    context = context.ifBlank { null }
                 )
             }
         )
     }
 
     /** Sends the on-device transcript to the backend and streams the answer. */
-    private suspend fun askAndPlayText(ctx: Context, turn: StreamedTurn): Boolean {
+    private suspend fun askAndPlayText(ctx: Context, turn: StreamedTurn,
+                                       context: String = ""): Boolean {
         return runTurn(
             ctx = ctx,
             anchorEpochMs = turn.speechEndEpochMs,
@@ -333,7 +426,8 @@ class VoiceService : Service() {
                     Prefs.serverUrl(ctx), Prefs.token(ctx), clientId = Prefs.clientId(ctx)
                 ).askStreamText(
                     turn.text, Prefs.voice(ctx), Prefs.llmModel(ctx),
-                    onText, onAudioChunk, onTurnId, onPlay
+                    onText, onAudioChunk, onTurnId, onPlay,
+                    context = context.ifBlank { null }
                 )
             }
         )

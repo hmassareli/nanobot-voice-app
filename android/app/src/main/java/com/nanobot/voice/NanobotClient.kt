@@ -7,6 +7,7 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -162,9 +163,10 @@ class NanobotClient(
         onAudioChunk: (ByteArray) -> Unit,
         onTurnId: ((String) -> Unit)? = null,
         onPlay: ((String) -> Unit)? = null,
-        audioFormat: String = "wav"
+        audioFormat: String = "wav",
+        context: String? = null
     ): StreamMetrics = streamRequest(
-        buildMultipart(audioBytes, voice, llmModel, audioFormat),
+        buildMultipart(audioBytes, voice, llmModel, audioFormat, context),
         onText, onAudioChunk, onTurnId, onPlay
     ) { fallback ->
         // Old server without /ask_stream — fall back to the plain endpoint.
@@ -188,12 +190,14 @@ class NanobotClient(
         onText: (String) -> Unit,
         onAudioChunk: (ByteArray) -> Unit,
         onTurnId: ((String) -> Unit)? = null,
-        onPlay: ((String) -> Unit)? = null
+        onPlay: ((String) -> Unit)? = null,
+        context: String? = null
     ): StreamMetrics {
         val json = JSONObject().apply {
             put("text", text)
             put("voice", voice)
             if (!llmModel.isNullOrBlank()) put("llm", llmModel)
+            if (!context.isNullOrBlank()) put("context", context)
         }
         val body = json.toString().toRequestBody("application/json".toMediaType())
         return streamRequest(body, onText, onAudioChunk, onTurnId, onPlay) { fallback ->
@@ -334,6 +338,66 @@ class NanobotClient(
     }
 
     /**
+     * Sintetiza texto -> audio direto no servidor (POST /tts), sem passar pelo
+     * LLM. Usado para falar o lembrete em voz. Devolve bytes vazios em falha.
+     */
+    fun tts(text: String, voice: String): ByteArray {
+        return try {
+            val json = JSONObject().apply {
+                put("text", text)
+                put("voice", voice)
+                put("format", "mp3")
+            }
+            val reqBuilder = Request.Builder()
+                .url("$baseUrl/tts")
+                .post(json.toString().toRequestBody("application/json".toMediaType()))
+            if (token.isNotBlank()) reqBuilder.header("Authorization", "Bearer $token")
+            if (!clientId.isNullOrBlank()) reqBuilder.header("X-Client-Id", clientId)
+            http.newCall(reqBuilder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    Log.w("NanobotClient", "/tts HTTP ${resp.code}")
+                    ByteArray(0)
+                } else {
+                    resp.body?.bytes() ?: ByteArray(0)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e("NanobotClient", "/tts falhou", t)
+            ByteArray(0)
+        }
+    }
+
+    /** Lista de lembretes pendentes (GET /reminders). Nunca lanca. */
+    fun fetchReminders(): JSONArray {
+        return try {
+            val reqBuilder = Request.Builder().url("$baseUrl/reminders").get()
+            if (token.isNotBlank()) reqBuilder.header("Authorization", "Bearer $token")
+            if (!clientId.isNullOrBlank()) reqBuilder.header("X-Client-Id", clientId)
+            http.newCall(reqBuilder.build()).execute().use { resp ->
+                val bodyStr = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
+                JSONObject(bodyStr).optJSONArray("reminders") ?: JSONArray()
+            }
+        } catch (t: Throwable) {
+            Log.w("NanobotClient", "fetchReminders: ${t.message}")
+            throw t
+        }
+    }
+
+    /** Avisa o servidor que o lembrete disparou (fire-and-forget). */
+    fun markReminderFired(id: String) {
+        try {
+            val reqBuilder = Request.Builder()
+                .url("$baseUrl/reminders/$id/fired")
+                .post("{}".toRequestBody("application/json".toMediaType()))
+            if (token.isNotBlank()) reqBuilder.header("Authorization", "Bearer $token")
+            http.newCall(reqBuilder.build()).execute().use { }
+        } catch (t: Throwable) {
+            Log.w("NanobotClient", "markReminderFired: ${t.message}")
+        }
+    }
+
+    /**
      * Fire-and-forget client telemetry. Posts [payload] (a JSON object) to
      * `$baseUrl/report` on a background thread. This method NEVER throws: any
      * failure (offline, timeout, bad response) is swallowed and logged, because
@@ -392,7 +456,8 @@ class NanobotClient(
         audioBytes: ByteArray,
         voice: String,
         llmModel: String?,
-        audioFormat: String = "wav"
+        audioFormat: String = "wav",
+        context: String? = null
     ): MultipartBody {
         // The phone encodes the utterance while recording (Opus, or AAC as a
         // fallback), so we ship ~8-17 KB instead of ~125 KB of raw WAV. The
@@ -411,6 +476,9 @@ class NanobotClient(
             .addFormDataPart("audio_format", audioFormat.lowercase())
         if (!llmModel.isNullOrBlank()) {
             builder.addFormDataPart("llm", llmModel)
+        }
+        if (!context.isNullOrBlank()) {
+            builder.addFormDataPart("context", context)
         }
         return builder.build()
     }

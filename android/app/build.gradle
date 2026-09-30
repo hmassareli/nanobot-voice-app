@@ -11,8 +11,8 @@ android {
         applicationId "com.nanobot.voice"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "1.1"
         ndk {
             // Redmi Note 7 (Snapdragon 660) is arm64-v8a; keep v7a as fallback.
             abiFilters 'arm64-v8a', 'armeabi-v7a'

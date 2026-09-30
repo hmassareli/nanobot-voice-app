@@ -43,6 +43,8 @@ class MainActivity : Activity() {
     private lateinit var voiceSpinner: Spinner
     private lateinit var followUpSpinner: Spinner
     private lateinit var sttSpinner: Spinner
+    private lateinit var reminderSpinner: Spinner
+    private lateinit var homeSsid: EditText
     private lateinit var wakeWord: EditText
     private lateinit var llmModel: EditText
     private lateinit var status: TextView
@@ -116,6 +118,20 @@ class MainActivity : Activity() {
             )
         }
         root.addView(sttSpinner)
+
+        root.addView(label("Lembretes por voz"))
+        reminderSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                Prefs.REMINDER_MODE_LABELS
+            )
+        }
+        root.addView(reminderSpinner)
+
+        homeSsid = field("SSID do Wi-Fi de casa", "", InputType.TYPE_CLASS_TEXT)
+        root.addView(label("SSID do Wi-Fi de casa (pra falar em voz)"))
+        root.addView(homeSsid)
 
         llmModel = field("Modelo LLM", Prefs.DEFAULT_LLM_MODEL, InputType.TYPE_CLASS_TEXT)
         root.addView(label("Modelo LLM"))
@@ -206,6 +222,9 @@ class MainActivity : Activity() {
         if (fIdx >= 0) followUpSpinner.setSelection(fIdx)
         val sIdx = Prefs.STT_MODE_VALUES.indexOf(Prefs.sttMode(this))
         if (sIdx >= 0) sttSpinner.setSelection(sIdx)
+        val rIdx = Prefs.REMINDER_MODE_VALUES.indexOf(Prefs.reminderMode(this))
+        if (rIdx >= 0) reminderSpinner.setSelection(rIdx)
+        homeSsid.setText(Prefs.homeSsid(this))
     }
 
     private fun savePrefs() {
@@ -216,6 +235,8 @@ class MainActivity : Activity() {
         val sttMode = Prefs.STT_MODE_VALUES.getOrElse(sttSpinner.selectedItemPosition) {
             Prefs.DEFAULT_STT_MODE
         }
+        val reminderMode = Prefs.REMINDER_MODE_VALUES
+            .getOrElse(reminderSpinner.selectedItemPosition) { Prefs.DEFAULT_REMINDER_MODE }
         Prefs.get(this).edit()
             .putString(Prefs.KEY_SERVER_URL, serverUrl.text.toString().trim())
             .putString(Prefs.KEY_TOKEN, token.text.toString().trim())
@@ -224,6 +245,8 @@ class MainActivity : Activity() {
             .putString(Prefs.KEY_LLM_MODEL, llmModel.text.toString().trim())
             .putInt(Prefs.KEY_FOLLOW_UP, followUp)
             .putString(Prefs.KEY_STT_MODE, sttMode)
+            .putString(Prefs.KEY_REMINDER_MODE, reminderMode)
+            .putString(Prefs.KEY_HOME_SSID, homeSsid.text.toString().trim())
             .apply()
         toast("Configurações salvas")
         setStatus("Configurações salvas.")
@@ -277,6 +300,13 @@ class MainActivity : Activity() {
             != PackageManager.PERMISSION_GRANTED
         ) {
             needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        // Localizacao e necessaria apenas para ler o SSID do Wi-Fi (lembretes
+        // por voz quando em casa). O Android nao libera SSID sem ela.
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
         }
         if (needed.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, needed.toTypedArray(), permRequestCode)

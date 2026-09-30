@@ -46,6 +46,7 @@ import threading
 import time
 import uuid
 import wave
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import re
@@ -55,6 +56,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import telemetry
+import reminders
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice-api")
@@ -120,6 +122,14 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "pt")
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "25"))
 
+# Fuso do usuário (America/Sao_Paulo, UTC-3, sem horário de verão desde 2019).
+# Fixado por offset para não depender do TZ do container.
+TZ_SAO_PAULO = timezone(timedelta(hours=-3))
+_WEEKDAYS_PT = (
+    "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
+    "sexta-feira", "sábado", "domingo",
+)
+
 app = FastAPI(title="nanobot-voice-api")
 
 # --- conversation memory (single-user voice app) ---------------------------
@@ -127,8 +137,21 @@ HISTORY: list[dict] = []
 MAX_HISTORY = 20
 
 
+def now_line() -> str:
+    """Data/hora atual em São Paulo, recalculada a cada chamada (nunca cacheada).
+
+    Ex.: 'Agora são 2026-09-30T14:21:00-03:00 (quarta-feira).'
+    Usa offset fixo -03:00 para não depender do TZ do container.
+    """
+    now = datetime.now(TZ_SAO_PAULO)
+    wd = _WEEKDAYS_PT[now.weekday()]
+    return (f"Agora são {now.isoformat(timespec='seconds')} ({wd}). "
+            f"Use SEMPRE esta hora como referência para datas e horários.")
+
+
 def build_system_prompt() -> str:
     parts = [
+        now_line(),
         "Você é o nanobot, um assistente pessoal de voz. Responda em português do "
         "Brasil, de forma concisa e falada (frases curtas, sem markdown, sem listas, "
         "sem emojis). Suas respostas serão convertidas em áudio.",
@@ -141,7 +164,26 @@ def build_system_prompt() -> str:
         "Para OUVIR/continuar um livro, use SEMPRE a ferramenta ouvir_livro_stream "
         "(toca o próximo trecho parágrafo a parágrafo, começando em poucos "
         "segundos). Só use ouvir_livro se a primeira falhar. Depois de chamar a "
-        "ferramenta, responda apenas algo curto como 'Tocando o próximo trecho.'",
+        "ferramenta, responda apenas algo curto como 'Tocando o próximo trecho.' "
+        "Para começar em uma posição específica (ex.: 'a partir do trecho 36'), "
+        "use o parâmetro a_partir_de da ouvir_livro_stream com o número do "
+        "trecho (1 = primeiro). NUNCA responda que vai tocar ou que tocou sem "
+        "CHAMAR a ferramenta — sem a chamada o áudio não toca de verdade. Se a "
+        "ferramenta retornar erro, avise o usuário com o erro, sem fingir que "
+        "funcionou.",
+        "Livros disponíveis no workspace: "
+        + (", ".join(_listar_livros()) or "nenhum")
+        + ". Se o usuário pedir 'o livro' sem nomear, não informe slug: a "
+          "ferramenta resolve sozinha para o livro em andamento.",
+        "Quando o usuário pedir para ser lembrado de algo, use a ferramenta "
+        "criar_lembrete (quando = horário ISO 8601 com fuso, ex.: "
+        "2026-09-30T18:00:00-03:00) e NUNCA diga que vai lembrar sem chamar a "
+        "ferramenta. Para horários relativos ('daqui a X minutos/horas', 'daqui "
+        "1 minutinho'), calcule a partir da hora atual informada acima, somando o "
+        "intervalo pedido — não chute 'de cabeça'. Se o usuário não disser data/"
+        "hora relativos, use o horário citado. Ao confirmar em voz, SEMPRE diga "
+        "o horário absoluto que ficou agendado (ex.: 'agendei para as 14h30'), "
+        "para o usuário perceber qualquer erro.",
     ]
     # SOUL.md gives the same personality as the main nanobot; USER.md carries the
     # user's profile/preferences. AGENTS.md is deliberately skipped: it documents
@@ -265,14 +307,15 @@ TOOLS = [
                 "Gera em voz o próximo trecho do livro (ou o trecho indicado) "
                 "usando o motor de voz local, SEM gastar tokens de LLM, e toca o "
                 "áudio no celular do usuário. Use quando ele pedir para "
-                "ouvir/continuar o livro."
+                "ouvir/continuar o livro. Parâmetro opcional a_partir_de: trecho "
+                "(1-based) a partir do qual começar."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "slug": {
                         "type": "string",
-                        "description": "Slug do livro (opcional se só houver um).",
+                        "description": "Slug do livro (opcional; sem slug, usa o livro em andamento).",
                     },
                     "trechos": {
                         "type": "integer",
@@ -281,6 +324,10 @@ TOOLS = [
                     "voz": {
                         "type": "string",
                         "description": "Voz: santa|dora|alex (padrão santa).",
+                    },
+                    "a_partir_de": {
+                        "type": "integer",
+                        "description": "Trecho (1-based) a partir do qual começar; ajusta o marcador antes de tocar.",
                     },
                 },
                 "required": [],
@@ -295,7 +342,9 @@ TOOLS = [
                 "PREFERIDA para ouvir/continuar o livro. Toca o próximo trecho em "
                 "voz, PARÁGRAFO A PARÁGRAFO, começando a falar em ~2-3s (em vez de "
                 "esperar o trecho inteiro). Use SEMPRE que o usuário pedir para "
-                "ouvir, tocar ou continuar o livro. Não gasta tokens de LLM."
+                "ouvir, tocar ou continuar o livro. Não gasta tokens de LLM. Para "
+                "começar numa posição específica use a_partir_de (número do trecho, "
+                "1-based). NUNCA responda que vai tocar sem CHAMAR esta ferramenta."
             ),
             "parameters": {
                 "type": "object",
@@ -312,8 +361,60 @@ TOOLS = [
                         "type": "string",
                         "description": "Voz: santa|dora|alex (padrão santa).",
                     },
+                    "a_partir_de": {
+                        "type": "integer",
+                        "description": "Trecho (1-based) a partir do qual começar; ajusta o marcador antes de tocar.",
+                    },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "criar_lembrete",
+            "description": (
+                "Agenda um lembrete para o usuário. Use quando ele pedir para "
+                "ser lembrado de algo. O celular dispara no horário e depois "
+                "fica ouvindo uma resposta curta. Nunca diga que vai lembrar "
+                "sem CHAMAR esta ferramenta."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "texto": {
+                        "type": "string",
+                        "description": "O que lembrar, em uma frase curta para ser falada (ex.: 'Ligar para o dentista').",
+                    },
+                    "quando": {
+                        "type": "string",
+                        "description": "Data/hora ISO 8601 com fuso (ex.: 2026-09-30T18:00:00-03:00). Também aceita epoch em ms.",
+                    },
+                },
+                "required": ["texto", "quando"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "listar_lembretes",
+            "description": "Lista os lembretes pendentes do usuário (id, texto e horário).",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancelar_lembrete",
+            "description": "Cancela um lembrete pelo id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Id do lembrete."},
+                },
+                "required": ["id"],
             },
         },
     },
@@ -428,8 +529,8 @@ async def _tool_play_audio(args: dict) -> str:
     """Tool `play_audio`: enqueue an existing file, or TTS `text` to a temp file.
 
     Returns the `__PLAY_AUDIO__:<host path>` sentinel on success."""
-    path = (args.get("path") or "").strip()
-    text = (args.get("text") or "").strip()
+    path = _as_str(args.get("path"))
+    text = _as_str(args.get("text"))
     if path:
         p = _resolve_audio_path(path)
         if not p.exists() or not p.is_file():
@@ -456,7 +557,7 @@ async def _tool_ouvir_livro(args: dict) -> str:
     time. If another is already running we return immediately (instead of
     stacking a second CPU-hungry process) so the model can tell the user to
     wait a moment."""
-    slug = (args.get("slug") or "").strip()
+    slug = _as_str(args.get("slug"))
     try:
         trechos = int(args.get("trechos") or 1)
     except (TypeError, ValueError):
@@ -465,7 +566,7 @@ async def _tool_ouvir_livro(args: dict) -> str:
     # HTTP read timeout is finite. More than a couple at once would exceed it and
     # the user would hear nothing.
     trechos = max(1, min(trechos, 2))
-    voz = (args.get("voz") or "santa").strip() or "santa"
+    voz = _as_str(args.get("voz")) or "santa"
 
     script = WORKSPACE / "skills" / "leitor-livros" / "scripts" / "livro_voz.py"
     if not script.exists():
@@ -537,12 +638,34 @@ def _listar_livros() -> list[str]:
 def _resolver_slug_livro(slug: str) -> str:
     """Resolve o slug: usa o informado; se vazio e houver um único livro, usa-o;
     senão levanta ValueError com uma mensagem amigável."""
-    slug = (slug or "").strip()
-    if slug:
-        return slug
+    slug = _as_str(slug)
     itens = _listar_livros()
+    if slug:
+        if slug in itens:
+            return slug
+        cand = [x for x in itens
+                if slug.lower() in x.lower() or x.lower() in slug.lower()]
+        if len(cand) == 1:
+            return cand[0]
+        raise ValueError(
+            f"livro '{slug}' não encontrado. Livros: " + (", ".join(itens) or "nenhum")
+        )
     if len(itens) == 1:
         return itens[0]
+    # Sem slug e varios livros: usa o livro com progresso de leitura,
+    # preferindo o atualizado mais recentemente.
+    com_progresso = []
+    for it in itens:
+        try:
+            est = json.loads(
+                (LIVROS_DIR / it / "estado.json").read_text(encoding="utf-8"))
+            if int(est.get("trecho") or 0) > 0:
+                com_progresso.append((str(est.get("atualizado") or ""), it))
+        except (OSError, ValueError):
+            pass
+    if com_progresso:
+        com_progresso.sort()
+        return com_progresso[-1][1]
     raise ValueError(
         "especifique o slug do livro. Livros: " + (", ".join(itens) or "nenhum")
     )
@@ -563,7 +686,8 @@ def _split_paragrafos(texto: str, max_par: int = 300) -> list[str]:
     return out
 
 
-async def stream_book_excerpt(slug: str, voz: str, trechos: int, stats: dict):
+async def stream_book_excerpt(slug: str, voz: str, trechos: int, stats: dict,
+                              a_partir_de: int | None = None):
     """Streaming EM PROCESSO de um trecho do livro, parágrafo a parágrafo.
 
     Reusa o Kokoro já carregado/aquecido no servidor (`tts_to_mp3_bytes`), sem
@@ -581,6 +705,7 @@ async def stream_book_excerpt(slug: str, voz: str, trechos: int, stats: dict):
     try:
         slug = _resolver_slug_livro(slug)
     except ValueError as e:
+        log.warning("book_stream slug invalido: %s", e)
         yield json.dumps({"type": "text", "text": str(e)}) + "\n"
         return
 
@@ -589,6 +714,7 @@ async def stream_book_excerpt(slug: str, voz: str, trechos: int, stats: dict):
         dados = json.loads((base / "trechos.json").read_text(encoding="utf-8"))
         estado = json.loads((base / "estado.json").read_text(encoding="utf-8"))
     except Exception as e:  # noqa: BLE001
+        log.warning("book_stream falha ao abrir %s: %s", slug, e)
         yield json.dumps({
             "type": "text",
             "text": f"não consegui abrir o livro {slug}: {e}",
@@ -600,6 +726,9 @@ async def stream_book_excerpt(slug: str, voz: str, trechos: int, stats: dict):
         i = int(estado.get("trecho") or 0)
     except (TypeError, ValueError):
         i = 0
+    if a_partir_de is not None:
+        i = max(0, min(int(a_partir_de) - 1, max(len(todos) - 1, 0)))
+        log.info("book_stream seek a_partir_de=%s -> indice %s", a_partir_de, i)
     if i >= len(todos):
         yield json.dumps({
             "type": "text",
@@ -618,6 +747,7 @@ async def stream_book_excerpt(slug: str, voz: str, trechos: int, stats: dict):
 
     # Não-bloqueante: nunca empilha uma segunda geração pesada.
     if not _BOOK_LOCK.acquire(blocking=False):
+        log.warning("book_stream lock ocupado, recusado")
         yield json.dumps({
             "type": "text",
             "text": ("já estou gerando um trecho do livro agora; "
@@ -680,15 +810,22 @@ async def _tool_ouvir_livro_stream(args: dict) -> str:
     captura para `stats["book_stream"]`. O /ask_stream sintetiza os parágrafos
     depois de falar a resposta curta do modelo, para o primeiro áudio chegar em
     ~2-3s."""
-    slug = (args.get("slug") or "").strip()
+    slug = _as_str(args.get("slug"))
     try:
         trechos = int(args.get("trechos") or 1)
     except (TypeError, ValueError):
         trechos = 1
     trechos = max(1, min(trechos, 2))
-    voz = (args.get("voz") or "santa").strip() or "santa"
+    voz = _as_str(args.get("voz")) or "santa"
+    a_partir_de = None
+    if args.get("a_partir_de") not in (None, ""):
+        try:
+            a_partir_de = max(1, int(args.get("a_partir_de")))
+        except (TypeError, ValueError):
+            a_partir_de = None
     return BOOK_STREAM_PREFIX + json.dumps(
-        {"slug": slug, "voz": voz, "trechos": trechos})
+        {"slug": slug, "voz": voz, "trechos": trechos,
+         "a_partir_de": a_partir_de})
 
 
 def _handle_tool_output(out: str, stats: dict) -> str:
@@ -698,6 +835,7 @@ def _handle_tool_output(out: str, stats: dict) -> str:
     `stats["play_audio"]` (so the HTTP layer can emit a `play` event) and return
     a short message for the model instead of the raw sentinel (which must never
     be spoken aloud)."""
+    log.info("TOOL<- %s out=%.300s", (stats.get("tool_calls") or ["?"])[-1], str(out)[:300])
     if isinstance(out, str) and out.startswith(PLAY_AUDIO_PREFIX):
         first, _, rest = out.partition("\n")
         path = first[len(PLAY_AUDIO_PREFIX):].strip()
@@ -717,7 +855,14 @@ def _handle_tool_output(out: str, stats: dict) -> str:
     return out
 
 
+def _as_str(v) -> str:
+    if v is None:
+        return ""
+    return v.strip() if isinstance(v, str) else str(v).strip()
+
+
 async def dispatch_tool(name: str, args: dict) -> str:
+    log.info("TOOL-> %s args=%.300s", name, json.dumps(args, ensure_ascii=False, default=str))
     try:
         if name == "read_file":
             p = _safe(args.get("path", ""))
@@ -734,6 +879,23 @@ async def dispatch_tool(name: str, args: dict) -> str:
             return await _tool_ouvir_livro(args)
         if name == "ouvir_livro_stream":
             return await _tool_ouvir_livro_stream(args)
+        if name == "criar_lembrete":
+            item = reminders.add_reminder(
+                args.get("texto") or args.get("text") or "",
+                args.get("quando") or args.get("fire_at"),
+                _as_str(args.get("delivery")) or "auto")
+            return (f"Lembrete criado (id {item['id']}): {item['texto']} "
+                    f"para {item['fire_at_iso']}. Ele vai te avisar no horário "
+                    "e te ouvir em seguida.")
+        if name == "listar_lembretes":
+            itens = reminders.list_pending()
+            if not itens:
+                return "Nenhum lembrete pendente."
+            return "\n".join(
+                f"{i['id']}: {i['texto']} ({i['fire_at_iso']})" for i in itens)
+        if name == "cancelar_lembrete":
+            ok = reminders.cancel_reminder(_as_str(args.get("id")))
+            return "Lembrete cancelado." if ok else "erro: lembrete não encontrado"
         if name == "curl":
             url = (args.get("url") or "").strip()
             if not url:
@@ -841,6 +1003,9 @@ async def run_agent(user_text: str, model: str | None = None,
     if not OPENROUTER_API_KEY:
         return "Serviço sem chave de LLM configurada."
     messages = [{"role": "system", "content": build_system_prompt()}]
+    if (stats or {}).get("context"):
+        messages.append({"role": "system", "content":
+                         "[Contexto do aplicativo] " + str(stats["context"])})
     messages += HISTORY[-MAX_HISTORY:]
     messages.append({"role": "user", "content": user_text})
 
@@ -924,6 +1089,9 @@ async def stream_agent(user_text: str, model: str | None = None,
         yield "Serviço sem chave de LLM configurada."
         return
     messages = [{"role": "system", "content": build_system_prompt()}]
+    if (stats or {}).get("context"):
+        messages.append({"role": "system", "content":
+                         "[Contexto do aplicativo] " + str(stats["context"])})
     messages += HISTORY[-MAX_HISTORY:]
     messages.append({"role": "user", "content": user_text})
 
@@ -1659,7 +1827,8 @@ async def _parse_input(request: Request) -> tuple[str, float, str | None, str | 
     stt_ms = 0.0
     voice: str | None = None
     llm: str | None = None
-    meta: dict = {"audio_in": None, "stt": {"model": None, "fallback_used": False}}
+    meta: dict = {"audio_in": None, "stt": {"model": None, "fallback_used": False},
+                  "context": None}
     if ctype.startswith("application/json"):
         try:
             body = await request.json()
@@ -1668,11 +1837,13 @@ async def _parse_input(request: Request) -> tuple[str, float, str | None, str | 
         text = (body.get("text") or "").strip()
         voice = (body.get("voice") or "").strip() or None
         llm = (body.get("llm") or body.get("model") or "").strip() or None
+        meta["context"] = (body.get("context") or "").strip() or None
         meta["stt"]["model"] = "text-input"
     else:
         form = await request.form()
         voice = (form.get("voice") or "").strip() or None
         llm = (form.get("llm") or form.get("model") or "").strip() or None
+        meta["context"] = (form.get("context") or "").strip() or None
         up = form.get("audio")
         if up is not None:
             suffix = Path(getattr(up, "filename", "") or "a.wav").suffix or ".wav"
@@ -1891,6 +2062,7 @@ async def ask_stream(request: Request):
             index = 0
             full_answer: list[str] = []
             llm_stats: dict = {}
+            llm_stats["context"] = (meta.get("context") or "").strip()
             tts_sentences: list[dict] = []
 
             # Queue carries ("sent", sentence) or ("end", None).
@@ -2007,6 +2179,7 @@ async def ask_stream(request: Request):
                     book_req.get("voz", "santa"),
                     book_req.get("trechos", 1),
                     llm_stats,
+                    book_req.get("a_partir_de"),
                 ):
                     yield chunk
 
@@ -2113,3 +2286,43 @@ async def report(request: Request):
     turn_id = (body.pop("turn_id", None) or "").strip() or None
     telemetry.record_client_report_safe(turn_id, body)
     return {"status": "ok"}
+
+
+# --- lembretes ---------------------------------------------------------------
+@app.get("/reminders")
+async def reminders_list(request: Request):
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return {"reminders": reminders.list_pending()}
+
+
+@app.post("/reminders")
+async def reminders_create(request: Request):
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    try:
+        item = reminders.add_reminder(
+            body.get("texto") or body.get("text"),
+            body.get("quando") or body.get("fire_at"),
+            body.get("delivery") or "auto")
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return item
+
+
+@app.post("/reminders/{rid}/cancel")
+async def reminders_cancel(rid: str, request: Request):
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return {"ok": reminders.cancel_reminder(rid)}
+
+
+@app.post("/reminders/{rid}/fired")
+async def reminders_fired(rid: str, request: Request):
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return {"ok": reminders.mark_fired(rid)}

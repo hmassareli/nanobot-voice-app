@@ -17,6 +17,13 @@ class BootReceiver : BroadcastReceiver() {
                 } catch (t: Throwable) {
                     Log.e(VoiceService.TAG, "Falha ao iniciar no boot", t)
                 }
+                try {
+                    // Alarmes nao sobrevivem ao reboot: reagendar + sync.
+                    ReminderReceiver.scheduleSync(context.applicationContext)
+                    Reminders.syncAsync(context.applicationContext)
+                } catch (t: Throwable) {
+                    Log.e(VoiceService.TAG, "Falha ao reagendar lembretes", t)
+                }
             }
         }
     }
